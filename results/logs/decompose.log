@@ -1,0 +1,21 @@
+$ C:\Users\garba\miniconda3\envs\torch-cuda\python.exe -u C:\pyprojects\jd_playground\jd-phase25-bench\iwrm_bench.py decompose --dataset cifar10 --widths 1 4 8 --batch-sizes 4 8 16 32 64 --warmup 1 --timed 3 --out C:\pyprojects\jd_playground\jd-phase25-bench\results
+
+[w=1 (0.13M) m=  4] forward 0.254s | gramian_pass 1.048s | weighting_qp 0.187s | backward_step 0.254s || QP share = 10.7%
+[w=1 (0.13M) m=  8] forward 0.134s | gramian_pass 0.550s | weighting_qp 0.112s | backward_step 0.136s || QP share = 12.1%
+[w=1 (0.13M) m= 16] forward 0.066s | gramian_pass 0.273s | weighting_qp 0.076s | backward_step 0.067s || QP share = 15.8%
+[w=1 (0.13M) m= 32] forward 0.035s | gramian_pass 0.129s | weighting_qp 0.084s | backward_step 0.032s || QP share = 30.0%
+[w=1 (0.13M) m= 64] forward 0.023s | gramian_pass 0.075s | weighting_qp 0.267s | backward_step 0.023s || QP share = 68.7%
+[w=4 (2.11M) m=  4] forward 0.338s | gramian_pass 2.694s | weighting_qp 0.235s | backward_step 0.355s || QP share =  6.5%
+[w=4 (2.11M) m=  8] forward 0.175s | gramian_pass 1.738s | weighting_qp 0.151s | backward_step 0.186s || QP share =  6.7%
+[w=4 (2.11M) m= 16] forward 0.087s | gramian_pass 1.076s | weighting_qp 0.106s | backward_step 0.097s || QP share =  7.8%
+[w=4 (2.11M) m= 32] forward 0.041s | gramian_pass 0.330s | weighting_qp 0.097s | backward_step 0.068s || QP share = 18.2%
+[w=4 (2.11M) m= 64] forward 0.032s | gramian_pass 0.252s | weighting_qp 0.296s | backward_step 0.056s || QP share = 46.6%
+[w=8 (8.42M) m=  4] forward 0.271s | gramian_pass 8.876s | weighting_qp 0.245s | backward_step 0.327s || QP share =  2.5%
+[w=8 (8.42M) m=  8] forward 0.187s | gramian_pass 6.063s | weighting_qp 0.176s | backward_step 0.213s || QP share =  2.7%
+[w=8 (8.42M) m= 16] forward 0.101s | gramian_pass 4.039s | weighting_qp 0.127s | backward_step 0.128s || QP share =  2.9%
+[w=8 (8.42M) m= 32] forward 0.067s | gramian_pass 0.871s | weighting_qp 0.143s | backward_step 0.121s || QP share = 11.9%
+[w=8 (8.42M) m= 64] forward 0.066s | gramian_pass 0.746s | weighting_qp 0.287s | backward_step 0.119s || QP share = 23.5%
+Saved C:\pyprojects\jd_playground\jd-phase25-bench\results\decompose_cifar10.png
+NOTE: epochs at small m contain more steps (1024/m), so compare the SHARES within a bar and how they shift with m and width, not bar heights.
+
+--- exit 0 in 151.1s ---

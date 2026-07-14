@@ -1,5 +1,3 @@
-results/
-!results/.gitkeep
 data/
 __pycache__/
 *.pt
