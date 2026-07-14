@@ -1,7 +1,7 @@
 ***
 
 ### 2. `RESULTS.md`
-*(Create this new file in your root directory. It contains the exact narrative you prepared, formatted to render the images seamlessly)*
+
 
 ```markdown
 # Phase 2.5 Results — CIFAR-10, RTX 5070 Ti Laptop, TorchJD 0.17.0

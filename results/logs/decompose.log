@@ -1,5 +1,3 @@
-$ C:\Users\garba\miniconda3\envs\torch-cuda\python.exe -u C:\pyprojects\jd_playground\jd-phase25-bench\iwrm_bench.py decompose --dataset cifar10 --widths 1 4 8 --batch-sizes 4 8 16 32 64 --warmup 1 --timed 3 --out C:\pyprojects\jd_playground\jd-phase25-bench\results
-
 [w=1 (0.13M) m=  4] forward 0.254s | gramian_pass 1.048s | weighting_qp 0.187s | backward_step 0.254s || QP share = 10.7%
 [w=1 (0.13M) m=  8] forward 0.134s | gramian_pass 0.550s | weighting_qp 0.112s | backward_step 0.136s || QP share = 12.1%
 [w=1 (0.13M) m= 16] forward 0.066s | gramian_pass 0.273s | weighting_qp 0.076s | backward_step 0.067s || QP share = 15.8%
@@ -15,7 +13,7 @@ $ C:\Users\garba\miniconda3\envs\torch-cuda\python.exe -u C:\pyprojects\jd_playg
 [w=8 (8.42M) m= 16] forward 0.101s | gramian_pass 4.039s | weighting_qp 0.127s | backward_step 0.128s || QP share =  2.9%
 [w=8 (8.42M) m= 32] forward 0.067s | gramian_pass 0.871s | weighting_qp 0.143s | backward_step 0.121s || QP share = 11.9%
 [w=8 (8.42M) m= 64] forward 0.066s | gramian_pass 0.746s | weighting_qp 0.287s | backward_step 0.119s || QP share = 23.5%
-Saved C:\pyprojects\jd_playground\jd-phase25-bench\results\decompose_cifar10.png
+Saved C:
 NOTE: epochs at small m contain more steps (1024/m), so compare the SHARES within a bar and how they shift with m and width, not bar heights.
 
 --- exit 0 in 151.1s ---

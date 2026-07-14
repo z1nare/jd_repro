@@ -1,10 +1,8 @@
-$ C:\Users\garba\miniconda3\envs\torch-cuda\python.exe -u C:\pyprojects\jd_playground\jd-phase25-bench\iwrm_bench.py engines --dataset cifar10 --warmup 3 --timed 10 --out C:\pyprojects\jd_playground\jd-phase25-bench\results
-
 [SGD-ERM (scalar)            ]   0.050 +/- 0.006 s/epoch | peak      54.5 MiB
 [autojac + UPGrad            ]   0.741 +/- 0.016 s/epoch | peak     602.6 MiB
 [autojac + UPGrad
 (optimize_gramian)]   0.758 +/- 0.021 s/epoch | peak     602.6 MiB
 [autogram + UPGradWeighting  ]   0.380 +/- 0.059 s/epoch | peak      83.2 MiB
-Saved C:\pyprojects\jd_playground\jd-phase25-bench\results\engines_cifar10.png
+Saved C:\
 
 --- exit 0 in 32.0s ---

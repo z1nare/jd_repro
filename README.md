@@ -1,6 +1,6 @@
 # TorchJD Phase 2.5 Benchmarks — CIFAR-10
 
-This repository contains the benchmarking and profiling suite for TorchJD (v0.17.0), evaluating performance, memory scaling, and algorithmic convergence on CIFAR-10 using an RTX 5070 Ti. 
+This repository contains the benchmarking and profiling suite for TorchJD (v0.17.0), evaluating performance, memory scaling, and algorithmic convergence on CIFAR-10 using an RTX 5070 Ti mobile. 
 
 **Core Objective:** Validate paper claims (Figure 2, Table 7) and isolate the specific computational bottlenecks (QP vs. Gramian accumulation) to scope kernel-level optimizations for Phase 3.
 

@@ -1,5 +1,3 @@
-$ C:\Users\garba\miniconda3\envs\torch-cuda\python.exe -u C:\pyprojects\jd_playground\jd-phase25-bench\iwrm_bench.py figure2 --dataset cifar10 --sweep --out C:\pyprojects\jd_playground\jd-phase25-bench\results
-
 [Mean] lr sweep (criterion: area under loss curve, paper D.1):
     lr=0.003    AUC=   1442.14  <- best so far
     lr=0.01     AUC=   1337.34  <- best so far
@@ -28,7 +26,7 @@ $ C:\Users\garba\miniconda3\envs\torch-cuda\python.exe -u C:\pyprojects\jd_playg
     lr=0.1      AUC=   1245.09  <- best so far
     lr=0.3      AUC=   1472.39
 [MGDA] final run @ lr=0.1
-Saved C:\pyprojects\jd_playground\jd-phase25-bench\results\figure2_cifar10.png
+Saved C:
 Success criterion: UPGrad below Mean (faster, lower); PCGrad/MGDA ordered as in the paper.
 
 --- exit 0 in 1000.1s ---
