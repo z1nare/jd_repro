@@ -1,7 +1,7 @@
 {
-  "preflight": true,
-  "figure2": true,
   "table7": true,
+  "figure2": true,
+  "preflight": true,
   "engines": true,
   "decompose": true,
   "scaling": true

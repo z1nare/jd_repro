@@ -1,7 +1,6 @@
 """
-run_all.py -- execute the full Phase 2.5 experiment suite in order and bundle
-the results for analysis. Cross-platform (tested logic on Linux; paths via
-pathlib, subprocess via sys.executable, so it runs the same on Windows).
+run_all.py -- execute the full benchmark suite (iwrm_bench.py subcommands) in
+order, logging each step and bundling the results.
 
 Usage:
     python run_all.py            # full suite (CIFAR-10, ~60-90 min on a 5070 Ti)
@@ -9,8 +8,8 @@ Usage:
     python run_all.py --only engines decompose   # run a subset
 
 Produces:
-    results/           all PNGs, JSONs, tables, per-step logs, env.json
-    results_bundle.zip everything zipped -- this is the file to share back.
+    results/            all PNGs, JSONs, tables, per-step logs, env.json
+    results_bundle.zip  the results/ directory zipped
 """
 
 from __future__ import annotations
@@ -64,6 +63,7 @@ def run(name: str, cmd_args: list[str]) -> bool:
         for line in proc.stdout:
             print(line, end="", flush=True)
             log.write(line)
+            log.flush()  # survive hard crashes (e.g. GPU driver reset) with the log intact
         proc.wait()
         dt = time.perf_counter() - t0
         log.write(f"\n--- exit {proc.returncode} in {dt:.1f}s ---\n")
@@ -96,24 +96,31 @@ def main():
     else:
         suite = {
             "preflight": ["preflight", *d],
-            # Deliverable A: per-aggregator lr sweep + full paper horizon (20 epochs)
-            "figure2":   ["figure2", *d, "--sweep"],
-            # Deliverable B: Table 7 ratios
+            # Per-aggregator lr sweep (paper D.1 criterion) + full paper horizon.
+            # The grid extends below 0.003 because PCGrad diverges at lr >= 0.01.
+            "figure2":   ["figure2", *d, "--sweep",
+                          "--lr-grid", "0.0003,0.001,0.003,0.01,0.03,0.1,0.3"],
+            # Table 7 ratio comparison
             "table7":    ["table7", *d, "--warmup", "3", "--timed", "10"],
-            # Deliverable C: 4-way engine comparison incl. optimize_gramian_computation
+            # 4-way engine comparison incl. optimize_gramian_computation
             "engines":   ["engines", *d, "--warmup", "3", "--timed", "10"],
-            # Phase-3 gate data: step decomposition across m and width
+            # Step decomposition across m and width
             "decompose": ["decompose", *d, "--widths", "1", "4", "8",
                           "--batch-sizes", "4", "8", "16", "32", "64",
                           "--warmup", "1", "--timed", "3"],
-            # Stretch: memory scaling; w=16 may OOM autojac on 12 GB -- that's the point
-            "scaling":   ["scaling", *d, "--widths", "1", "2", "4", "8", "16",
+            # Memory scaling. w=16 needs >12 GB for autojac and reproducibly
+            # crashes the GPU driver on this machine (DPC_WATCHDOG); run it only
+            # on a GPU with >=16 GB.
+            "scaling":   ["scaling", *d, "--widths", "1", "2", "4", "8",
                           "--warmup", "1", "--timed", "3"],
         }
 
     dump_env()
     names = args.only if args.only else list(suite)
-    status = {}
+    # Merge with any existing status so `--only` runs don't clobber the record
+    # of steps that were run previously.
+    status_file = RESULTS / "status.json"
+    status = json.loads(status_file.read_text()) if status_file.exists() else {}
     for name in names:
         if name not in suite:
             print(f"unknown step {name!r}; choices: {list(suite)}"); continue

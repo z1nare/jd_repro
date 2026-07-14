@@ -1,32 +1,43 @@
+$ C:\Users\garba\miniconda3\envs\torch-cuda\python.exe -u C:\pyprojects\jd_playground\jd-phase25-bench\iwrm_bench.py figure2 --dataset cifar10 --sweep --lr-grid 0.0003,0.001,0.003,0.01,0.03,0.1,0.3 --out C:\pyprojects\jd_playground\jd-phase25-bench\results
+
 [Mean] lr sweep (criterion: area under loss curve, paper D.1):
+    lr=0.0003   AUC=   1472.70  <- best so far
+    lr=0.001    AUC=   1464.92  <- best so far
     lr=0.003    AUC=   1442.14  <- best so far
     lr=0.01     AUC=   1337.34  <- best so far
     lr=0.03     AUC=   1094.86  <- best so far
     lr=0.1      AUC=    772.31  <- best so far
     lr=0.3      AUC=    489.74  <- best so far
+    warning [Mean]: selected lr=0.3 is a grid endpoint; the optimum may lie outside the tested range.
 [Mean] final run @ lr=0.3
 [UPGrad] lr sweep (criterion: area under loss curve, paper D.1):
+    lr=0.0003   AUC=   1464.72  <- best so far
+    lr=0.001    AUC=   1435.33  <- best so far
     lr=0.003    AUC=   1329.64  <- best so far
     lr=0.01     AUC=   1057.37  <- best so far
     lr=0.03     AUC=    794.59  <- best so far
     lr=0.1      AUC=    470.25  <- best so far
     lr=0.3      AUC=    391.65  <- best so far
+    warning [UPGrad]: selected lr=0.3 is a grid endpoint; the optimum may lie outside the tested range.
 [UPGrad] final run @ lr=0.3
 [PCGrad] lr sweep (criterion: area under loss curve, paper D.1):
-    lr=0.003    AUC=    574.60  <- best so far
-    lr=0.01     AUC=       nan
-    lr=0.03     AUC=       nan
-    lr=0.1      AUC=       nan
-    lr=0.3      AUC=       nan
+    lr=0.0003   AUC=   1131.08  <- best so far
+    lr=0.001    AUC=    919.07  <- best so far
+    lr=0.003    AUC=    573.65  <- best so far
+    lr=0.01     AUC=       nan  (diverged)
+    lr=0.03     AUC=       nan  (diverged)
+    lr=0.1      AUC=       nan  (diverged)
+    lr=0.3      AUC=       nan  (diverged)
 [PCGrad] final run @ lr=0.003
 [MGDA] lr sweep (criterion: area under loss curve, paper D.1):
+    lr=0.0003   AUC=   1473.82  <- best so far
+    lr=0.001    AUC=   1467.62  <- best so far
     lr=0.003    AUC=   1448.94  <- best so far
     lr=0.01     AUC=   1355.83  <- best so far
     lr=0.03     AUC=   1260.03  <- best so far
     lr=0.1      AUC=   1245.09  <- best so far
     lr=0.3      AUC=   1472.39
 [MGDA] final run @ lr=0.1
-Saved C:
-Success criterion: UPGrad below Mean (faster, lower); PCGrad/MGDA ordered as in the paper.
+Saved C:\pyprojects\jd_playground\jd-phase25-bench\results\figure2_cifar10.png
 
---- exit 0 in 1000.1s ---
+--- exit 0 in 707.3s ---

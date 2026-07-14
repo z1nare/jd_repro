@@ -1,0 +1,13 @@
+$ C:\Users\garba\miniconda3\envs\torch-cuda\python.exe -u C:\pyprojects\jd_playground\jd-phase25-bench\iwrm_bench.py scaling --dataset cifar10 --widths 1 2 4 8 --warmup 1 --timed 3 --out C:\pyprojects\jd_playground\jd-phase25-bench\results
+
+[w=1 | 0.13M params | autojac ] 0.731 s/epoch, peak 603 MiB
+[w=1 | 0.13M params | autogram] 0.288 s/epoch, peak 83 MiB
+[w=2 | 0.53M params | autojac ] 1.410 s/epoch, peak 1207 MiB
+[w=2 | 0.53M params | autogram] 0.297 s/epoch, peak 203 MiB
+[w=4 | 2.11M params | autojac ] 3.168 s/epoch, peak 2516 MiB
+[w=4 | 2.11M params | autogram] 0.562 s/epoch, peak 635 MiB
+[w=8 | 8.42M params | autojac ] 7.697 s/epoch, peak 5530 MiB
+[w=8 | 8.42M params | autogram] 1.599 s/epoch, peak 2279 MiB
+Saved C:\pyprojects\jd_playground\jd-phase25-bench\results\scaling_cifar10.png
+
+--- exit 0 in 70.1s ---

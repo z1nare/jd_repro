@@ -1,20 +1,23 @@
 """
-Phase 2.5 harness: reproduce the JD paper's IWRM benchmarks and profile TorchJD.
+Benchmark and profiling harness for TorchJD on the IWRM setting of
+"Jacobian Descent for Multi-Objective Optimization" (arXiv:2406.16232v3).
 
-Reproduces (from "Jacobian Descent for Multi-Objective Optimization", arXiv:2406.16232v3):
-  - Figure 2 (loss curves, UPGrad vs Mean vs PCGrad vs MGDA) on CIFAR-10/SVHN,
-    1024-image subset, batch 32, IWRM via SSJD, paper-exact CNNs (Appendix D).
-  - Table 7 per-aggregator epoch times (compare RATIOS to the paper, not absolutes).
-  - autojac vs autogram engine comparison (time + peak memory) -- the money slide.
+Reproduces the paper's small-scale experiments and adds engine-level profiling:
+  - Figure 2 loss curves (UPGrad / Mean / PCGrad / MGDA) on CIFAR-10 or SVHN,
+    1024-image subset, batch 32, IWRM via SSJD, Appendix D architectures.
+  - Table 7 per-aggregator epoch times (ratios relative to Mean).
+  - autojac vs autogram engine comparison (time and peak memory).
+  - Per-step timing decomposition and model-width scaling.
 
 Subcommands:
   preflight  -- pref_vector audit, engine-equivalence assertion, autogram compat check
-  figure2    -- aggregator sweep -> loss-curve plot (with optional per-aggregator lr sweep)
+  figure2    -- aggregator training runs -> loss-curve plot (optional per-aggregator lr sweep)
   table7     -- per-aggregator epoch timing -> ratio table vs paper's Table 7
   engines    -- autojac vs autogram (UPGrad): time + peak memory bar chart
-  scaling    -- width-multiplier sweep of both engines (stretch goal)
+  scaling    -- width-multiplier sweep of both engines
+  decompose  -- per-segment timing of one autogram step across (m, width)
 
-Examples (run on the GPU box):
+Examples:
   python iwrm_bench.py preflight --dataset cifar10
   python iwrm_bench.py figure2  --dataset cifar10 --sweep
   python iwrm_bench.py table7   --dataset cifar10 --warmup 3 --timed 10
@@ -22,7 +25,7 @@ Examples (run on the GPU box):
   python iwrm_bench.py scaling  --dataset cifar10 --widths 1 2 4 8
 
 Requires: torch, torchvision, matplotlib, and `pip install "torchjd[quadprog_projector]"`.
-Smoke-test anywhere with `--dataset synthetic` (random data, same shapes).
+`--dataset synthetic` runs on random data with the same shapes (no downloads).
 """
 
 from __future__ import annotations
@@ -341,22 +344,37 @@ def cmd_preflight(args):
     tol = 1e-4 if device.type == "cpu" else 5e-4
     print(f"[gate 3] {args.k_steps}-step trajectory max param diff = {max_diff:.2e} "
           f"(tolerance {tol:.0e})")
-    assert max_diff < tol, "autojac and autogram trajectories diverged - investigate!"
-    print("PREFLIGHT PASSED - benchmark results can be presented as ground truth.")
+    assert max_diff < tol, "autojac and autogram trajectories diverged"
+    print("preflight passed (3/3 gates)")
 
 
 def lr_sweep(dataset, agg_name, grid, args, X, Y, epochs) -> tuple[float, float]:
     """Paper D.1 (pragmatic version): pick lr minimizing area under the loss curve."""
     best_lr, best_auc = None, float("inf")
+    n_finite = 0
     for lr in grid:
         _, step = fresh(dataset, agg_name, lr, args, "autojac")
         curve = run_training(step, X, Y, epochs, args.batch_size, args.seed,
                              device_from_arg(args.device))
         auc = sum(curve)
+        finite = all(map(math.isfinite, curve))
+        n_finite += int(finite)
         marker = ""
-        if auc < best_auc and all(map(math.isfinite, curve)):
+        if finite and auc < best_auc:
             best_lr, best_auc, marker = lr, auc, "  <- best so far"
+        else:
+            marker = "  (diverged)" if not finite else ""
         print(f"    lr={lr:<8g} AUC={auc:10.2f}{marker}")
+
+    if best_lr is None:
+        raise RuntimeError(
+            f"[{agg_name}] every lr in the grid diverged ({grid}); extend the grid downward.")
+    if n_finite == 1:
+        print(f"    warning [{agg_name}]: only one finite lr ({best_lr}); selection is "
+              "not a real optimum, extend the grid downward.")
+    elif best_lr in (grid[0], grid[-1]):
+        print(f"    warning [{agg_name}]: selected lr={best_lr} is a grid endpoint; the "
+              "optimum may lie outside the tested range.")
     return best_lr, best_auc
 
 
@@ -394,7 +412,6 @@ def cmd_figure2(args):
     fig_path = out / f"figure2_{args.dataset}.png"
     plt.savefig(fig_path, dpi=160)
     print(f"Saved {fig_path}")
-    print("Success criterion: UPGrad below Mean (faster, lower); PCGrad/MGDA ordered as in the paper.")
 
 
 def cmd_table7(args):
@@ -486,7 +503,7 @@ def cmd_scaling(args):
                 print(f"[w={w} | {n_params/1e6:.2f}M params | {engine:8s}] "
                       f"{mean_s:.3f} s/epoch, peak {peak:.0f} MiB")
             except torch.cuda.OutOfMemoryError:
-                print(f"[w={w} | {engine}] OOM  <-- this datapoint IS the slide")
+                print(f"[w={w} | {engine}] OOM (recorded)")
                 results[engine].append({"width": w, "params": n_params, "oom": True})
                 torch.cuda.empty_cache()
     args.width = 1
@@ -515,10 +532,9 @@ SEGMENTS = ["forward", "gramian_pass", "weighting_qp", "backward_step"]
 
 def cmd_decompose(args):
     """Split one autogram JD step into four timed segments, across an (m, width)
-    grid. m is varied via batch size (IWRM: m = batch size). This chart is the
-    Phase-3 decision: which segment dominates at RL-relevant m (4-8) vs large N.
+    grid. m is varied via batch size (IWRM: m = batch size).
 
-    Segments (autogram path -- note per-objective backward work and Gramian
+    Segments (autogram path -- per-objective backward work and Gramian
     accumulation are fused into one pass by design; that fused pass is
     'gramian_pass'):
       forward        model(x) + per-instance CE losses
@@ -595,7 +611,7 @@ def cmd_decompose(args):
         plt.bar(labels, vals, bottom=bottom, label=seg, color=colors[seg])
         bottom = [b + v for b, v in zip(bottom, vals)]
     plt.ylabel("s / epoch (batch=m; #steps varies with m)")
-    plt.title(f"{args.dataset}: autogram step decomposition -- where does the time go?")
+    plt.title(f"{args.dataset}: autogram step time decomposition")
     plt.legend(); plt.grid(alpha=0.3, axis="y"); plt.tight_layout()
     plt.savefig(out / f"decompose_{args.dataset}.png", dpi=160)
     print(f"Saved {out / f'decompose_{args.dataset}.png'}")
