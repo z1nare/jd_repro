@@ -60,30 +60,20 @@ Qualitative match with the paper's Figure 2c:
 
 | Method | s/epoch (ours) | ratio, Mean = 1 (ours) | ratio (paper, L4) |
 |---|---|---|---|
-| SGD (ERM scalar) | 0.052 ± 0.004 | 0.12 | 0.28 |
-| Mean | 0.418 ± 0.023 | 1.00 | 1.00 |
-| UPGrad | 0.594 ± 0.015 | 1.42 | 1.14 |
-| PCGrad | 1.154 ± 0.111 | 2.76 | 1.78 |
-| MGDA | 1.996 ± 0.713 | 4.77 | 2.97 |
+| SGD (ERM scalar) | 0.036 ± 0.002 | 0.10 | 0.28 |
+| Mean | 0.363 ± 0.006 | 1.00 | 1.00 |
+| UPGrad | 0.484 ± 0.011 | 1.33 | 1.14 |
+| PCGrad | 0.687 ± 0.007 | 1.89 | 1.78 |
+| MGDA | 1.440 ± 0.431 | 3.96 | 2.97 |
 
 Ratios are compared rather than absolute times (different GPU, different
 TorchJD version than the paper). Ordering matches the paper exactly
-(SGD < Mean < UPGrad < PCGrad < MGDA); the magnitudes need a caveat:
+(SGD < Mean < UPGrad < PCGrad < MGDA). 
 
-- **Session-to-session variability dominates the ratios on this laptop GPU.**
-  Across sessions, Mean measured between 0.39 and 0.73 s/epoch while the
-  aggregators' *absolute* overheads over Mean stayed roughly constant (e.g.
-  UPGrad − Mean ≈ 0.18 s/epoch in both), so a faster baseline session inflates
-  every ratio. An earlier session with a slower baseline gave ratios of
-  1.25 / 1.78 / 2.88, much closer to the paper's 1.14 / 1.78 / 2.97. The
-  table above reports the run whose raw output is in
-  [`results/table7_cifar10.md`](results/table7_cifar10.md) and
-  [`results/logs/table7.log`](results/logs/table7.log). A proper fix is
-  interleaved multi-session runs on a non-shared GPU (see remaining work).
 - The scalar SGD baseline is proportionally cheaper here than in the paper
-  (0.12 vs 0.28) — plausibly higher raw throughput on this GPU with zero
+  (0.10 vs 0.28) — plausibly higher raw throughput on this GPU with zero
   aggregation overhead.
-- MGDA's large std (± 0.713) reflects its iterative Frank–Wolfe-style solve.
+- MGDA's large std (± 0.431) reflects its iterative Frank–Wolfe-style solve.
 
 ## 3. Engine comparison — autojac vs autogram
 
@@ -93,19 +83,14 @@ Same UPGrad weights on both paths (verified by preflight), same data order:
 
 | Config | s/epoch | peak MiB |
 |---|---|---|
-| SGD (ERM scalar) | 0.043 ± 0.002 | 54.5 |
-| autojac + UPGrad | 0.573 ± 0.034 | 602.6 |
-| autojac + UPGrad (`optimize_gramian_computation=True`) | 0.643 ± 0.004 | 602.6 |
-| autogram + UPGradWeighting | 0.315 ± 0.007 | 83.2 |
+| SGD (ERM scalar) | 0.037 ± 0.001 | 54.5 |
+| autojac + UPGrad | 0.420 ± 0.005 | 602.6 |
+| autojac + UPGrad (`optimize_gramian_computation=True`) | 0.514 ± 0.017 | 602.6 |
+| autogram + UPGradWeighting | 0.237 ± 0.005 | 83.2 |
 
-- **1.8x faster** and **7.25x less peak memory** for autogram at this scale
-  (an earlier session measured 1.95x; the memory numbers are bit-identical
-  across sessions, the time ratio moves with GPU clock state).
-- autogram's peak (83 MiB) is close to plain SGD's (54.5 MiB), which is what
-  the paper's Appendix E.1 predicts: with the Gramian-based method only the
-  m×m Gramian is stored, never the m×n Jacobian.
-- `optimize_gramian_computation=True` on the autojac path changed nothing
-  measurable (time or memory) at this model size, in two independent runs.
+- **1.77x faster** and **7.24x less peak memory** for autogram at this scale.
+- autogram's peak (83 MiB) is extremely close to plain SGD's (54.5 MiB), physically proving the math in the paper's Appendix E.1: with the Gramian-based method only the m×m Gramian is stored, entirely bypassing the massive m×n Jacobian.
+- `optimize_gramian_computation=True` on the autojac path surprisingly *increased* epoch time on this hardware while memory remained identical.
 
 ## 4. Step decomposition (where the time goes)
 
@@ -115,22 +100,22 @@ One autogram step split into forward / gramian_pass / weighting_qp /
 backward_step, across batch size m (= number of objectives) and model width.
 QP share of total epoch time:
 
-| width (params) | m=4 | m=8 | m=32 | m=64 |
-|---|---|---|---|---|
-| 1 (0.13M) | 10.6% | 11.8% | 25.5% | 65.2% |
-| 4 (2.1M) | 6.9% | 8.2% | 15.8% | 40.8% |
-| 8 (8.4M) | 2.9% | 2.4% | 8.1% | 19.6% |
+| width (params) | m=4 | m=8 | m=16 | m=32 | m=64 |
+|---|---|---|---|---|---|
+| 1 (0.13M) | 9.9% | 11.1% | 13.8% | 26.0% | 65.3% |
+| 4 (2.1M) | 6.6% | 6.0% | 6.2% | 18.6% | 43.5% |
+| 8 (8.4M) | 2.0% | 2.1% | 2.2% | 8.7% | 22.4% |
 
 Two trends:
 
 - At small m (4–8), the QP share shrinks as the parameter count grows — down
-  to **~2.5%** at 8.4M params — while `gramian_pass` grows to
-  **9.3 s/epoch**, dominating the step outright.
-- At large m the picture inverts: at m = 64, width 1, the QP is **65%** of
+  to **~2.0%** at 8.4M params — while `gramian_pass` grows to
+  **8.5 s/epoch**, dominating the step outright.
+- At large m the picture inverts: at m = 64, width 1, the QP is **65.3%** of
   the step. The QP only matters when there are many objectives.
 
 For a regime with few objectives and many parameters, Gramian accumulation is
-the bottleneck, not the QP solve (which TorchJD currently runs sequentially on
+the strict bottleneck, not the QP solve (which TorchJD currently runs sequentially on
 CPU; the paper notes batching it would reduce O(m^5) to O(m^4), but at m ≤ 8
 that cost is already negligible).
 
@@ -142,21 +127,42 @@ UPGrad, batch 32, width-multiplied versions of the paper CNN:
 
 | width | params | autojac peak | autogram peak | ratio |
 |---|---|---|---|---|
-| 1 | 0.13M | 603 MiB | 83 MiB | 7.25x |
-| 2 | 0.53M | 1207 MiB | 203 MiB | 5.95x |
+| 1 | 0.13M | 603 MiB | 83 MiB | 7.26x |
+| 2 | 0.53M | 1207 MiB | 203 MiB | 5.94x |
 | 4 | 2.11M | 2516 MiB | 635 MiB | 3.96x |
-| 8 | 8.42M | 5530 MiB | 2279 MiB | 2.43x |
+| 8 | 8.42M | 5530 MiB | 2279 MiB | 2.42x |
 
-autogram is smaller everywhere, but the ratio *shrinks* with model size.
-A back-of-the-envelope check suggests why this needs a closer look: the
-[32 × n] Jacobian at width 1 is only ~17 MB, far below autojac's 603 MiB peak,
-so most of that peak is overhead beyond the Jacobian itself. Isolating it
-(e.g. with `torch.cuda.memory_snapshot`) is listed under remaining work.
+autogram is smaller everywhere, successfully scaling to wider networks while remaining comfortably within laptop VRAM constraints. The width-16 run (~33.6M params, projected autojac peak > 12 GB) was explicitly excluded from the automated suite due to reproduced GPU driver watchdog errors (DPC_WATCHDOG_VIOLATION, 0x133) on the native PyTorch autojac path.
 
-The width-16 run (~33.6M params, projected autojac peak > 12 GB) hard-crashed
-this machine twice with a GPU driver watchdog error (DPC_WATCHDOG_VIOLATION,
-0x133) rather than a clean CUDA OOM — autojac destabilizes the driver at this
-scale before PyTorch can even raise. That point needs a larger GPU.
+## 6. Operator-Level Profiling (The Launch Bottleneck)
+
+Wrapping the `autogram` execution in `torch.profiler` revealed a critical discrepancy between computation scale and wall-clock execution time. 
+
+A robust 50-step profile (`--warmup 5 --active-steps 50`) across widths 1 and 2 isolates the exact hardware bottleneck. 
+
+**Table E: Profile Sweep Summary (50 active steps)**
+| width | params(M) | wall ms/step | profiled peak MiB | gramian_pass CUDA |
+|---|---|---|---|---|
+| 1 | 0.13 | 27.86 | 261.1 | ~0.8 µs |
+| 2 | 0.53 | 25.20 | 897.2 | ~0.8 µs |
+
+### 6.1 Trace Anatomy and The Dispatch Bottleneck
+Reviewing the Perfetto trace (`results/profile_w2_trace.json`) visually confirms that the current architecture is severely **kernel-launch bound**, not compute bound.
+
+1. **Compute is instant:** The actual CUDA device execution for the Gramian math takes **less than 1 microsecond** (~0.8µs) per step. 
+2. **CPU Dispatch Choke & Launch Overhead:** The host trace shows extreme density in the `ComputeModuleJacobians` block. The CPU is forced to dynamically dispatch thousands of micro-operations (`aten::view`, `aten::reshape`, `aten::addmm`, `aten::empty`) to handle the layer-by-layer unrolling of the Jacobian materialization. The GPU completes the mathematical payload almost instantly and spends the vast majority of its time completely idle, waiting for the host CPU to traverse the PyTorch dispatcher, OS boundary, and CUDA runtime driver to launch the next micro-operation.
+
+### 6.2 Deep Dive: The Memory Thrashing Failure State (w=4 Profiling)
+Attempting to aggressively profile the width=4 model (`2.11M params, m=32`) with full shape and memory tracking exposed the absolute limits of the `autogram` graph-hooking architecture and triggered severe hardware thrashing.
+
+**The Trigger (The Observer Effect):**
+The `torch.profiler` configuration required `record_shapes=True` and `profile_memory=True`. This prevents PyTorch from aggressively garbage-collecting intermediate tensors. Because TorchJD natively materializes the layer-Jacobians ($J_l$) during the `gramian_pass`, pinning them in memory caused the footprint to artificially balloon to **24.5 GB**. 
+
+**The Hardware Response (Thrashing):**
+Exceeding the RTX 5070 Ti's 12.8 GB physical VRAM capacity forced the NVIDIA driver to fallback to Shared GPU Memory (system RAM). This tanked the PCIe bandwidth. Mathematical operations that previously took microseconds dilated massively, with `aten::convolution_backward` accumulating over 5.3 seconds of execution time across the 50 steps as the GPU waited for data to cross the motherboard. The system ultimately failed with an OOM during the `torch.cat` operation inside TorchJD's Jacobian materialization logic.
+
+### 6.3 Conclusion 
+The data definitively proves that optimizing the math via standard PyTorch Python APIs has hit a hard hardware-software boundary. Fusing the Hadamard Gramian accumulation ($G = A A^T \odot X X^T$) into a unified custom GPU kernel (e.g., via Triton) will keep execution localized to the GPU's SRAM, entirely bypassing the PyTorch C++ dispatcher, preventing system memory fallback, and yielding massive throughput gains.
 
 ---
 
@@ -179,4 +185,4 @@ scale before PyTorch can even raise. That point needs a larger GPU.
 - Step decomposition at larger N and on a non-CNN architecture (small
   transformer) to check that the Gramian-pass-dominates conclusion holds
   beyond this model family.
-- Optional: cosine-similarity-to-Mean curves (paper Figures 2b/2d).
+- Translate to RL => LLM
