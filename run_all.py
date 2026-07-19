@@ -114,22 +114,13 @@ def main():
             # on a GPU with >=16 GB.
             "scaling":   ["scaling", *d, "--widths", "1", "2", "4", "8",
                           "--warmup", "1", "--timed", "3"],
-            # Operator-level CPU+GPU+memory profile. LAPTOP-SAFE DEFAULTS
-            # ONLY -- see AUTO_EXCLUDE below, this never runs unattended.
+            # Operator-level CPU+GPU+memory profile. Conservative widths
+            # (1,2) even though it's now auto-included -- see the note above.
             "profile":   ["profile", *d, "--widths", "1", "2",
                           "--warmup", "3", "--active-steps", "5"],
         }
-
-    # "profile" adds torch.profiler tracing overhead ON TOP OF normal compute
-    # (record_shapes + profile_memory can be 2-5x slower than a plain step),
-    # which means real extra thermal load -- and this machine has a logged
-    # DPC_WATCHDOG crash at width=16 even WITHOUT profiler overhead. Never let
-    # it ride along in an unattended `python run_all.py` -- only reachable via
-    # an explicit `--only profile` so a human is watching nvidia-smi.
-    AUTO_EXCLUDE = {"profile"}
-
     dump_env()
-    names = args.only if args.only else [n for n in suite if n not in AUTO_EXCLUDE]
+    names = args.only if args.only else list(suite)
     # Merge with any existing status so `--only` runs don't clobber the record
     # of steps that were run previously.
     status_file = RESULTS / "status.json"

@@ -16,6 +16,7 @@ Subcommands:
   engines    -- autojac vs autogram (UPGrad): time + peak memory bar chart
   scaling    -- width-multiplier sweep of both engines
   decompose  -- per-segment timing of one autogram step across (m, width)
+  profile    -- CPU+GPU+memory operator-level profile (torch.profiler), across widths
 
 Examples:
   python iwrm_bench.py preflight --dataset cifar10
@@ -54,8 +55,12 @@ from torchjd.aggregation import (
 from torchjd.autogram import Engine
 from torchjd.autojac import backward, jac_to_grad
 from torch.profiler import profile, ProfilerActivity, record_function
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  
+
 AGGREGATORS = {
-    # name -> (Aggregator ctor [autojac path], Weighting ctor [autogram path])
     "Mean": (Mean, MeanWeighting),
     "UPGrad": (UPGrad, UPGradWeighting),
     "PCGrad": (PCGrad, PCGradWeighting),
@@ -103,7 +108,6 @@ def ema(xs: list[float], alpha: float = 0.05) -> list[float]:
 # ----------------------------------------------------------------------------- data
 def load_data(dataset: str, root: str, subset: int, seed: int, device: torch.device):
     """Return (X, Y) preloaded on `device`. X: [N,3,32,32] float32, Y: [N] int64.
-
     Preprocessing matches the paper (Appendix D.6): per-channel normalization with
     mean/std computed on the ENTIRE training split. Subset indices are seeded and
     saved next to the data so every run uses the same 1024 images.
@@ -186,16 +190,23 @@ def make_model(dataset: str, width_mult: int = 1) -> nn.Sequential:
     raise ValueError(dataset)
 
 
+_INIT_CACHE: dict[tuple, dict] = {}  # (dataset, seed, width) -> state_dict, in-process cache
+
+
 def init_state(dataset: str, seed: int, out_dir: Path, width_mult: int = 1) -> dict:
-    """One canonical initialization per (dataset, seed, width): saved to disk so every
-    aggregator/engine run starts from bit-identical weights."""
+    # One canonical initialization per (dataset, seed, width)
+    key = (dataset, seed, width_mult)
+    if key in _INIT_CACHE:
+        return _INIT_CACHE[key]
     f = out_dir / f"init_{dataset}_w{width_mult}_seed{seed}.pt"
     if f.exists():
-        return torch.load(f)
-    set_seed(seed)
-    sd = make_model(dataset, width_mult).state_dict()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(sd, f)
+        sd = torch.load(f)
+    else:
+        set_seed(seed)
+        sd = make_model(dataset, width_mult).state_dict()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(sd, f)
+    _INIT_CACHE[key] = sd
     return sd
 
 
@@ -218,7 +229,6 @@ def make_step_autojac(model, aggregator, optimizer, optimize_gramian: bool = Fal
         return float(losses.mean().detach())
 
     return step
-
 
 def make_step_autogram(model, weighting, optimizer, batch_dim: int = 0):
     engine = Engine(model, batch_dim=batch_dim)
@@ -248,13 +258,17 @@ def make_step_sgd_erm(model, optimizer):
     return step
 
 
+def _run_epoch(step, X, Y, batch_size: int, epoch: int, seed: int) -> list[float]:
+    # One epoch's worth of step() calls
+    return [step(X[idx], Y[idx]) for idx in batch_order(len(X), batch_size, epoch, seed)]
+
+
 def run_training(step, X, Y, epochs: int, batch_size: int, seed: int,
                  device: torch.device) -> list[float]:
     """Run `epochs` epochs; return per-iteration mean batch loss."""
     curve = []
     for ep in range(epochs):
-        for idx in batch_order(len(X), batch_size, ep, seed):
-            curve.append(step(X[idx], Y[idx]))
+        curve += _run_epoch(step, X, Y, batch_size, ep, seed)
     sync(device)
     return curve
 
@@ -262,18 +276,14 @@ def run_training(step, X, Y, epochs: int, batch_size: int, seed: int,
 def timed_epochs(step, X, Y, warmup: int, timed: int, batch_size: int, seed: int,
                  device: torch.device) -> tuple[float, float, float]:
     """Return (mean s/epoch, std s/epoch, peak GPU memory in MiB during timed part)."""
-    for ep in range(warmup):
-        for idx in batch_order(len(X), batch_size, ep, seed):
-            step(X[idx], Y[idx])
-    sync(device)
+    run_training(step, X, Y, warmup, batch_size, seed, device)  # untimed; syncs at the end
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     times = []
     for ep in range(warmup, warmup + timed):
         sync(device)
         t0 = time.perf_counter()
-        for idx in batch_order(len(X), batch_size, ep, seed):
-            step(X[idx], Y[idx])
+        _run_epoch(step, X, Y, batch_size, ep, seed)
         sync(device)
         times.append(time.perf_counter() - t0)
     peak_mib = torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else float("nan")
@@ -302,10 +312,23 @@ def fresh(dataset, agg_name, lr, args, engine: str):
     raise ValueError(engine)
 
 
-def cmd_preflight(args):
-    device = device_from_arg(args.device)
-    out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
-    X, Y = load_data(args.dataset, args.data_root, args.subset, args.seed, device)
+def _build_autogram(dataset, seed, out, width, device, lr):
+    # Model + optimizer + autogram Engine + UPGradWeighting, built ONCE per width. 
+    model = make_model(dataset, width)
+    model.load_state_dict(init_state(dataset, seed, out, width))
+    model.to(device)
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    engine = Engine(model, batch_dim=0)
+    weighting = UPGradWeighting()
+    return model, opt, engine, weighting
+
+
+def _reset_weights(model, dataset, seed, out, width, lr):
+    model.load_state_dict(init_state(dataset, seed, out, width))
+    return torch.optim.SGD(model.parameters(), lr=lr)
+
+
+def cmd_preflight(args, device, out, X, Y):
 
     # --- Gate 1: pref_vector audit (structural). UPGrad must wrap UPGradWeighting
     # with identical defaults; both default to uniform 1/m via MeanWeighting.
@@ -348,14 +371,13 @@ def cmd_preflight(args):
     print("preflight passed (3/3 gates)")
 
 
-def lr_sweep(dataset, agg_name, grid, args, X, Y, epochs) -> tuple[float, float]:
+def lr_sweep(dataset, agg_name, grid, args, X, Y, epochs, device) -> tuple[float, float]:
     """Paper D.1 (pragmatic version): pick lr minimizing area under the loss curve."""
     best_lr, best_auc = None, float("inf")
     n_finite = 0
     for lr in grid:
         _, step = fresh(dataset, agg_name, lr, args, "autojac")
-        curve = run_training(step, X, Y, epochs, args.batch_size, args.seed,
-                             device_from_arg(args.device))
+        curve = run_training(step, X, Y, epochs, args.batch_size, args.seed, device)
         auc = sum(curve)
         finite = all(map(math.isfinite, curve))
         n_finite += int(finite)
@@ -378,10 +400,7 @@ def lr_sweep(dataset, agg_name, grid, args, X, Y, epochs) -> tuple[float, float]
     return best_lr, best_auc
 
 
-def cmd_figure2(args):
-    device = device_from_arg(args.device)
-    out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
-    X, Y = load_data(args.dataset, args.data_root, args.subset, args.seed, device)
+def cmd_figure2(args, device, out, X, Y):
     epochs = args.epochs or PAPER_EPOCHS.get(args.dataset, 20)
     grid = [float(g) for g in args.lr_grid.split(",")]
 
@@ -389,7 +408,7 @@ def cmd_figure2(args):
     for agg in args.aggs:
         if args.sweep:
             print(f"[{agg}] lr sweep (criterion: area under loss curve, paper D.1):")
-            lr, _ = lr_sweep(args.dataset, agg, grid, args, X, Y, epochs)
+            lr, _ = lr_sweep(args.dataset, agg, grid, args, X, Y, epochs, device)
         else:
             lr = args.lr
         print(f"[{agg}] final run @ lr={lr}")
@@ -399,9 +418,6 @@ def cmd_figure2(args):
 
     (out / f"figure2_{args.dataset}.json").write_text(json.dumps(results))
 
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
 
     plt.figure(figsize=(7, 4.5))
     for agg, r in results.items():
@@ -414,10 +430,9 @@ def cmd_figure2(args):
     print(f"Saved {fig_path}")
 
 
-def cmd_table7(args):
-    device = device_from_arg(args.device)
-    out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
-    X, Y = load_data(args.dataset, args.data_root, args.subset, args.seed, device)
+def cmd_table7(args, device, out, X, Y):
+    """Per-aggregator epoch times vs paper Table 7. Compare RATIOS only, not
+    absolute seconds -- different GPU and TorchJD version than the paper."""
     paper = PAPER_TABLE7.get(args.dataset, {})
 
     rows = []
@@ -439,13 +454,9 @@ def cmd_table7(args):
     print("\n" + table)
     (out / f"table7_{args.dataset}.md").write_text(table + "\n")
     print(f"\nSaved {out / f'table7_{args.dataset}.md'}")
-    print("Compare RATIOS only (different GPU / TorchJD version than the paper).")
 
 
-def cmd_engines(args):
-    device = device_from_arg(args.device)
-    out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
-    X, Y = load_data(args.dataset, args.data_root, args.subset, args.seed, device)
+def cmd_engines(args, device, out, X, Y):
 
     configs = [("SGD-ERM (scalar)", "Mean", "sgd-erm"),
                ("autojac + UPGrad", "UPGrad", "autojac"),
@@ -462,9 +473,6 @@ def cmd_engines(args):
     (out / f"engines_{args.dataset}.json").write_text(json.dumps(
         [{"label": l, "s_per_epoch": m, "std": s, "peak_mib": p} for l, m, s, p in rows]))
 
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
 
     labels = [r[0] for r in rows]
     colors = ["#999", "#c44", "#e58", "#2a7"]
@@ -484,10 +492,7 @@ def cmd_engines(args):
     print(f"Saved {fig_path}")
 
 
-def cmd_scaling(args):
-    device = device_from_arg(args.device)
-    out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
-    X, Y = load_data(args.dataset, args.data_root, args.subset, args.seed, device)
+def cmd_scaling(args, device, out, X, Y):
 
     results = {"autojac": [], "autogram": []}
     for w in args.widths:
@@ -510,9 +515,6 @@ def cmd_scaling(args):
 
     (out / f"scaling_{args.dataset}.json").write_text(json.dumps(results))
 
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
 
     plt.figure(figsize=(7, 4.5))
     for engine, color in [("autojac", "#c44"), ("autogram", "#2a7")]:
@@ -530,7 +532,7 @@ def cmd_scaling(args):
 SEGMENTS = ["forward", "gramian_pass", "weighting_qp", "backward_step"]
 
 
-def cmd_decompose(args):
+def cmd_decompose(args, device, out, X, Y):
     """Split one autogram JD step into four timed segments, across an (m, width)
     grid. m is varied via batch size (IWRM: m = batch size).
 
@@ -542,21 +544,13 @@ def cmd_decompose(args):
       weighting_qp   UPGradWeighting(G)               [m QPs, CPU, incl. transfer]
       backward_step  losses.backward(w) + SGD step
     """
-    device = device_from_arg(args.device)
-    out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
-    X, Y = load_data(args.dataset, args.data_root, args.subset, args.seed, device)
 
     results = []
     for w in args.widths:
-        model = make_model(args.dataset, w)
-        model.load_state_dict(init_state(args.dataset, args.seed, out, w))
-        model.to(device)
+        model, _, engine, weighting = _build_autogram(args.dataset, args.seed, out, w, device, args.lr)
         n_params = sum(p.numel() for p in model.parameters())
         for m in args.batch_sizes:
-            model.load_state_dict(init_state(args.dataset, args.seed, out, w))
-            opt = torch.optim.SGD(model.parameters(), lr=args.lr)
-            engine = Engine(model, batch_dim=0)
-            weighting = UPGradWeighting()
+            opt = _reset_weights(model, args.dataset, args.seed, out, w, args.lr)
 
             def seg_step(x, y, acc=None):
                 if acc is None:
@@ -597,9 +591,6 @@ def cmd_decompose(args):
 
     (out / f"decompose_{args.dataset}.json").write_text(json.dumps(results, indent=1))
 
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
 
     labels = [f"w={r['width']}\nm={r['m']}" for r in results]
     colors = {"forward": "#bbb", "gramian_pass": "#2a7",
@@ -615,38 +606,29 @@ def cmd_decompose(args):
     plt.legend(); plt.grid(alpha=0.3, axis="y"); plt.tight_layout()
     plt.savefig(out / f"decompose_{args.dataset}.png", dpi=160)
     print(f"Saved {out / f'decompose_{args.dataset}.png'}")
-    print("NOTE: epochs at small m contain more steps (1024/m), so compare the "
-          "SHARES within a bar and how they shift with m and width, not bar heights.")
-    
-def cmd_profile(args):
-    device = device_from_arg(args.device)
-    out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
-    X, Y = load_data(args.dataset, args.data_root, args.subset, args.seed, device)
- 
+
+
+# ----------------------------------------------------------------------------- profile
+def cmd_profile(args, device, out, X, Y):
     if max(args.widths) > 4:
         print(f"** WARNING: --widths includes {max(args.widths)} (>4). Profiler overhead "
               f"stacks on top of your machine's known width=16 DPC_WATCHDOG crash. Watch "
               f"`nvidia-smi -l 1` in another terminal, or lower --widths. **")
- 
+
     activities = [ProfilerActivity.CPU]
     if device.type == "cuda":
         activities.append(ProfilerActivity.CUDA)
     seg_names = set(SEGMENTS)
- 
+
     summary_rows = []
     for w in args.widths:
         args.width = w
-        model = make_model(args.dataset, w)
-        model.load_state_dict(init_state(args.dataset, args.seed, out, w))
-        model.to(device)
-        opt = torch.optim.SGD(model.parameters(), lr=args.lr)
-        engine = Engine(model, batch_dim=0)
-        weighting = UPGradWeighting()
+        model, opt, engine, weighting = _build_autogram(args.dataset, args.seed, out, w, device, args.lr)
         n_params = sum(p.numel() for p in model.parameters())
- 
+
         idx_pool = batch_order(len(X), args.batch_size, 0, args.seed)
         x, y = X[idx_pool[0]], Y[idx_pool[0]]
- 
+
         def profiled_step():
             with record_function("forward"):
                 losses = loss_fn(model(x), y)
@@ -657,28 +639,28 @@ def cmd_profile(args):
             with record_function("backward_step"):
                 losses.backward(wts)
                 opt.step(); opt.zero_grad()
- 
+
         for _ in range(args.warmup):                     # untimed, real -- burns in
             profiled_step()                               # cuDNN autotune / lazy CUDA init
         sync(device)                                      # (a) clean boundary before timing
- 
+
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
- 
+
         sync(device); t_wall0 = time.perf_counter()        # (c) synced wall-clock bracket
         with profile(activities=activities, record_shapes=True,
                      profile_memory=True, with_stack=False) as prof:
             for _ in range(args.active_steps):
                 profiled_step()
         sync(device); t_wall1 = time.perf_counter()
- 
+
         wall_ms = 1000 * (t_wall1 - t_wall0) / args.active_steps
         peak_mib = (torch.cuda.max_memory_allocated(device) / 2**20
                    if device.type == "cuda" else float("nan"))
- 
+
         time_sort = "self_cuda_time_total" if device.type == "cuda" else "self_cpu_time_total"
         mem_sort = "self_cuda_memory_usage" if device.type == "cuda" else "self_cpu_memory_usage"
- 
+
         # ---- Table A: operator time (self-time sorted, CPU+GPU) ----
         table_time = prof.key_averages().table(sort_by=time_sort, row_limit=20)
         # ---- Table B: operator memory (which ops allocate the most) ----
@@ -692,34 +674,39 @@ def cmd_profile(args):
         seg_rows = {e.key: e for e in prof.key_averages() if e.key in seg_names}
         seg_summary = {
             k: {"cpu_us": e.self_cpu_time_total / args.active_steps,
-               "cuda_us": (e.self_cuda_time_total / args.active_steps
+               "cuda_us": (getattr(e, "self_device_time_total", getattr(e, "self_cuda_time_total", 0)) / args.active_steps
                           if device.type == "cuda" else float("nan"))}
             for k, e in seg_rows.items()
         }
- 
+
         (out / f"profile_w{w}_time.txt").write_text(table_time)
         (out / f"profile_w{w}_memory.txt").write_text(table_mem)
         (out / f"profile_w{w}_shapes.txt").write_text(table_shape)
         trace_path = out / f"profile_w{w}_trace.json"
         prof.export_chrome_trace(str(trace_path))
- 
+
         print(f"\n{'='*70}\nwidth={w} ({n_params/1e6:.2f}M params) m={args.batch_size} "
               f"device={device}\n{'='*70}")
         print(f"wall time/step: {wall_ms:.2f} ms   peak memory: {peak_mib:.1f} MiB")
-        print("\n-- segment breakdown (per step, from record_function labels) --")
+        print("segment breakdown (per step):")
         for seg in SEGMENTS:
             r = seg_summary.get(seg, {"cpu_us": float("nan"), "cuda_us": float("nan")})
             print(f"  {seg:15s} cpu={r['cpu_us']:9.1f}us  cuda={r['cuda_us']:9.1f}us")
-        print("\n-- Table A: top operators by self time --")
-        print(table_time)
-        print(f"Trace saved: {trace_path}  (open in https://ui.perfetto.dev)")
- 
+            
+        real_ops = sorted((e for e in prof.key_averages() if e.key not in seg_names),
+                          key=lambda e: getattr(e, time_sort.replace("cuda", "device"), getattr(e, time_sort, 0)), reverse=True)
+        print("top ops by self time: " + ", ".join(
+            f"{e.key}({getattr(e, time_sort.replace('cuda', 'device'), getattr(e, time_sort, 0)):.0f}us)" for e in real_ops[:3]))
+        
+        print(f"full tables: {out}/profile_w{w}_{{time,memory,shapes}}.txt")
+        print(f"trace: {trace_path}  (open in https://ui.perfetto.dev)")
+
         summary_rows.append({"width": w, "params": n_params, "wall_ms": wall_ms,
                              "peak_mib": peak_mib, "segments": seg_summary})
- 
+
     args.width = 1
     (out / f"profile_{args.dataset}_summary.json").write_text(json.dumps(summary_rows, indent=2))
- 
+
     # ---- Table E: width-sweep summary ----
     print(f"\n{'='*70}\nTable E -- profile sweep summary across widths\n{'='*70}")
     print(f"{'width':>6} | {'params(M)':>10} | {'wall ms/step':>13} | {'peak MiB':>9} | "
@@ -732,8 +719,6 @@ def cmd_profile(args):
         print(f"{r['width']:>6} | {r['params']/1e6:>10.2f} | {r['wall_ms']:>13.2f} | "
               f"{r['peak_mib']:>9.1f} | {gram_pct:>9.1f}% | {qp_pct:>6.1f}%")
     print(f"\nSaved {out / f'profile_{args.dataset}_summary.json'}")
-
-
 
 
 # ----------------------------------------------------------------------------- main
@@ -749,36 +734,36 @@ def main():
     common.add_argument("--lr", type=float, default=0.03)
     common.add_argument("--aggs", nargs="+", default=["Mean", "UPGrad", "PCGrad", "MGDA"],
                         choices=list(AGGREGATORS))
- 
+
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
- 
+
     sp = sub.add_parser("preflight", parents=[common])
     sp.add_argument("--k-steps", type=int, default=3)
- 
+
     sf = sub.add_parser("figure2", parents=[common])
     sf.add_argument("--epochs", type=int, default=None, help="default: paper horizon")
     sf.add_argument("--sweep", action="store_true", help="per-aggregator lr sweep (paper D.1)")
     sf.add_argument("--lr-grid", default="0.003,0.01,0.03,0.1,0.3")
     sf.add_argument("--smooth", type=float, default=0.05, help="EMA alpha for the plot")
- 
+
     for name in ("table7", "engines"):
         st = sub.add_parser(name, parents=[common])
         st.add_argument("--warmup", type=int, default=3)
         st.add_argument("--timed", type=int, default=10)
- 
+
     ss = sub.add_parser("scaling", parents=[common])
     ss.add_argument("--widths", nargs="+", type=int, default=[1, 2, 4, 8])
     ss.add_argument("--warmup", type=int, default=1)
     ss.add_argument("--timed", type=int, default=3)
- 
+
     sd = sub.add_parser("decompose", parents=[common])
     sd.add_argument("--widths", nargs="+", type=int, default=[1, 4])
     sd.add_argument("--batch-sizes", nargs="+", type=int, default=[4, 8, 16, 32, 64])
     sd.add_argument("--warmup", type=int, default=1)
     sd.add_argument("--timed", type=int, default=3)
- 
+
     # LAPTOP-SAFE DEFAULTS: widths [1,2], not [1,4] or [1,2,4,8] like the
     # commands above -- profiler tracing overhead adds real thermal load on
     # top of the compute itself. Raise --widths deliberately, not by habit.
@@ -786,13 +771,17 @@ def main():
     spf.add_argument("--widths", nargs="+", type=int, default=[1, 2])
     spf.add_argument("--warmup", type=int, default=3)
     spf.add_argument("--active-steps", type=int, default=5)
- 
+
     args = p.parse_args()
     set_seed(args.seed)
-    {"preflight": cmd_preflight, "figure2": cmd_figure2, "table7": cmd_table7,
-     "engines": cmd_engines, "scaling": cmd_scaling, "decompose": cmd_decompose,
-     "profile": cmd_profile}[args.cmd](args)
- 
- 
+    device = device_from_arg(args.device)
+    out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
+    X, Y = load_data(args.dataset, args.data_root, args.subset, args.seed, device)
+    handlers = {"preflight": cmd_preflight, "figure2": cmd_figure2, "table7": cmd_table7,
+               "engines": cmd_engines, "scaling": cmd_scaling, "decompose": cmd_decompose,
+               "profile": cmd_profile}
+    handlers[args.cmd](args, device, out, X, Y)
+
+
 if __name__ == "__main__":
     main()
