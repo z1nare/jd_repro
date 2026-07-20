@@ -55,10 +55,10 @@ from torchjd.aggregation import (
 from torchjd.autogram import Engine
 from torchjd.autojac import backward, jac_to_grad
 from torch.profiler import profile, ProfilerActivity, record_function
-
+from hadamard import algorithm3
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  
+import matplotlib.pyplot as plt   
 
 AGGREGATORS = {
     "Mean": (Mean, MeanWeighting),
@@ -309,6 +309,13 @@ def fresh(dataset, agg_name, lr, args, engine: str):
         return model, make_step_autojac(model, agg_ctor(), opt, optimize_gramian=True)
     if engine == "autogram":
         return model, make_step_autogram(model, weighting_ctor(), opt)
+    if engine == "algo3-hadamard":
+        def step(x, y):
+            g = algorithm3(model, x, y)
+            wts = UPGradWeighting()(g)
+            (loss_fn(model(x), y)).backward(wts)  # or reuse the cached forward
+            opt.step(); opt.zero_grad()
+        return model, step
     raise ValueError(engine)
 
 
@@ -458,10 +465,13 @@ def cmd_table7(args, device, out, X, Y):
 
 def cmd_engines(args, device, out, X, Y):
 
-    configs = [("SGD-ERM (scalar)", "Mean", "sgd-erm"),
-               ("autojac + UPGrad", "UPGrad", "autojac"),
-               ("autojac + UPGrad\n(optimize_gramian)", "UPGrad", "autojac-ogc"),
-               ("autogram + UPGradWeighting", "UPGrad", "autogram")]
+    configs = [
+        ("SGD-ERM (scalar)", "Mean", "sgd-erm"),
+        ("autojac + UPGrad", "UPGrad", "autojac"),
+        ("autojac + UPGrad\n(optimize_gramian)", "UPGrad", "autojac-ogc"),
+        ("autogram + UPGradWeighting", "UPGrad", "autogram"),
+        ("algo3-hadamard + UPGradWeighting", "UPGrad", "algo3-hadamard"),  # <-- ADDED
+    ]
     rows = []
     for label, agg, engine in configs:
         _, step = fresh(args.dataset, agg, args.lr, args, engine)
@@ -473,19 +483,16 @@ def cmd_engines(args, device, out, X, Y):
     (out / f"engines_{args.dataset}.json").write_text(json.dumps(
         [{"label": l, "s_per_epoch": m, "std": s, "peak_mib": p} for l, m, s, p in rows]))
 
-
     labels = [r[0] for r in rows]
-    colors = ["#999", "#c44", "#e58", "#2a7"]
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    colors = ["#999", "#c44", "#e58", "#2a7", "#17becf"]  # Added color for algo3
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
     axes[0].bar(labels, [r[1] for r in rows], yerr=[r[2] for r in rows], color=colors)
     axes[0].set_ylabel("s / epoch"); axes[0].set_title("Time per epoch")
     axes[1].bar(labels, [r[3] for r in rows], color=colors)
     axes[1].set_ylabel("peak MiB"); axes[1].set_title("Peak GPU memory")
     for ax in axes:
-        ax.tick_params(axis="x", rotation=12, labelsize=8); ax.grid(alpha=0.3, axis="y")
-    by_label = {r[0]: r for r in rows}
-    speedup = by_label["autojac + UPGrad"][1] / by_label["autogram + UPGradWeighting"][1]
-    fig.suptitle(f"{args.dataset}: autogram is {speedup:.2f}x faster than autojac (same UPGrad weights)")
+        ax.tick_params(axis="x", rotation=15, labelsize=7); ax.grid(alpha=0.3, axis="y")
+    
     fig.tight_layout()
     fig_path = out / f"engines_{args.dataset}.png"
     fig.savefig(fig_path, dpi=160)
@@ -494,18 +501,18 @@ def cmd_engines(args, device, out, X, Y):
 
 def cmd_scaling(args, device, out, X, Y):
 
-    results = {"autojac": [], "autogram": []}
+    results = {"autojac": [], "autogram": [], "algo3-hadamard": []}  # <-- ADDED key
     for w in args.widths:
         args.width = w
         n_params = sum(p.numel() for p in make_model(args.dataset, w).parameters())
-        for engine in ("autojac", "autogram"):
+        for engine in ("autojac", "autogram", "algo3-hadamard"):    # <-- ADDED engine
             try:
                 _, step = fresh(args.dataset, "UPGrad", args.lr, args, engine)
                 mean_s, _, peak = timed_epochs(step, X, Y, args.warmup, args.timed,
                                                args.batch_size, args.seed, device)
                 results[engine].append({"width": w, "params": n_params,
                                         "s_per_epoch": mean_s, "peak_mib": peak})
-                print(f"[w={w} | {n_params/1e6:.2f}M params | {engine:8s}] "
+                print(f"[w={w} | {n_params/1e6:.2f}M params | {engine:14s}] "
                       f"{mean_s:.3f} s/epoch, peak {peak:.0f} MiB")
             except torch.cuda.OutOfMemoryError:
                 print(f"[w={w} | {engine}] OOM (recorded)")
@@ -515,9 +522,9 @@ def cmd_scaling(args, device, out, X, Y):
 
     (out / f"scaling_{args.dataset}.json").write_text(json.dumps(results))
 
-
     plt.figure(figsize=(7, 4.5))
-    for engine, color in [("autojac", "#c44"), ("autogram", "#2a7")]:
+    engine_colors = [("autojac", "#c44"), ("autogram", "#2a7"), ("algo3-hadamard", "#17becf")]
+    for engine, color in engine_colors:
         pts = [r for r in results[engine] if "oom" not in r]
         plt.plot([r["params"] / 1e6 for r in pts], [r["peak_mib"] for r in pts],
                  "o-", label=engine, color=color)
@@ -632,17 +639,17 @@ def cmd_profile(args, device, out, X, Y):
         def profiled_step():
             with record_function("forward"):
                 losses = loss_fn(model(x), y)
+            sync(device)
             with record_function("gramian_pass"):
                 g = engine.compute_gramian(losses)
+            sync(device)
             with record_function("weighting_qp"):
                 wts = weighting(g)
+            sync(device)
             with record_function("backward_step"):
                 losses.backward(wts)
                 opt.step(); opt.zero_grad()
-
-        for _ in range(args.warmup):                     # untimed, real -- burns in
-            profiled_step()                               # cuDNN autotune / lazy CUDA init
-        sync(device)                                      # (a) clean boundary before timing
+            sync(device)
 
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
