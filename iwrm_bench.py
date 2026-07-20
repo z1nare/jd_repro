@@ -310,11 +310,13 @@ def fresh(dataset, agg_name, lr, args, engine: str):
     if engine == "autogram":
         return model, make_step_autogram(model, weighting_ctor(), opt)
     if engine == "algo3-hadamard":
-        def step(x, y):
-            g = algorithm3(model, x, y)
-            wts = UPGradWeighting()(g)
-            (loss_fn(model(x), y)).backward(wts)  # or reuse the cached forward
+        weighting = UPGradWeighting()                      
+        def step(x, y) -> float:
+            g, logits = algorithm3(model, x, y)            
+            losses = loss_fn(logits, y)
+            losses.backward(weighting(g).to(losses.dtype))
             opt.step(); opt.zero_grad()
+            return float(losses.mean().detach())
         return model, step
     raise ValueError(engine)
 
@@ -375,7 +377,14 @@ def cmd_preflight(args, device, out, X, Y):
     print(f"[gate 3] {args.k_steps}-step trajectory max param diff = {max_diff:.2e} "
           f"(tolerance {tol:.0e})")
     assert max_diff < tol, "autojac and autogram trajectories diverged"
-    print("preflight passed (3/3 gates)")
+    # --- Gate 4: algorithm3 Gramian exact match
+    # Compute the Gramian using your custom algorithm
+    g_h, logits_h = algorithm3(model, X[:args.batch_size], Y[:args.batch_size])
+    
+    # G was computed by autogram earlier in Gate 2
+    assert (g_h - G).abs().max() < 1e-4 * G.abs().max(), "algorithm3 Gramian does not match autogram!"
+    print("[gate 4] algorithm3 Gramian exact match. OK")
+    print("preflight passed (4/4 gates)")
 
 
 def lr_sweep(dataset, agg_name, grid, args, X, Y, epochs, device) -> tuple[float, float]:
