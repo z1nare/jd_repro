@@ -1,0 +1,40 @@
+/home/arsenii/jd-phase25-bench/iwrm_bench.py:143: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  idx = torch.load(idx_file)
+Files already downloaded and verified
+    (pre-attempt: 12 MiB still allocated)
+[w=1 | 0.13M params | autojac       ] 0.442 s/epoch, peak 602 MiB
+    (pre-attempt: 28 MiB still allocated)
+[w=1 | 0.13M params | autogram      ] 0.304 s/epoch, peak 82 MiB
+    (pre-attempt: 28 MiB still allocated)
+[w=1 | 0.13M params | algo3-hadamard] 0.194 s/epoch, peak 134 MiB
+    (pre-attempt: 28 MiB still allocated)
+[w=2 | 0.53M params | autojac       ] 0.768 s/epoch, peak 1206 MiB
+    (pre-attempt: 28 MiB still allocated)
+[w=2 | 0.53M params | autogram      ] 0.307 s/epoch, peak 203 MiB
+    (pre-attempt: 28 MiB still allocated)
+[w=2 | 0.53M params | algo3-hadamard] 0.213 s/epoch, peak 239 MiB
+    (pre-attempt: 28 MiB still allocated)
+[w=4 | 2.11M params | autojac       ] 1.492 s/epoch, peak 2515 MiB
+    (pre-attempt: 28 MiB still allocated)
+[w=4 | 2.11M params | autogram      ] 0.353 s/epoch, peak 633 MiB
+    (pre-attempt: 28 MiB still allocated)
+[w=4 | 2.11M params | algo3-hadamard] 0.233 s/epoch, peak 407 MiB
+    (pre-attempt: 28 MiB still allocated)
+[w=8 | 8.42M params | autojac       ] 3.122 s/epoch, peak 5530 MiB
+    (pre-attempt: 28 MiB still allocated)
+[w=8 | 8.42M params | autogram      ] 0.615 s/epoch, peak 2278 MiB
+    (pre-attempt: 28 MiB still allocated)
+[w=8 | 8.42M params | algo3-hadamard] 0.333 s/epoch, peak 816 MiB
+    (pre-attempt: 28 MiB still allocated)
+[w=16 | 33.61M params | autojac       ] 7.182 s/epoch, peak 13140 MiB
+    (pre-attempt: 28 MiB still allocated)
+[w=16 | 33.61M params | autogram      ] 1.630 s/epoch, peak 8686 MiB
+    (pre-attempt: 28 MiB still allocated)
+[w=16 | 33.61M params | algo3-hadamard] 0.567 s/epoch, peak 1722 MiB
+    (pre-attempt: 28 MiB still allocated)
+[w=32 | autojac] OOM (recorded)
+    (pre-attempt: 28 MiB still allocated)
+[w=32 | autogram] OOM (recorded)
+    (pre-attempt: 28 MiB still allocated)
+[w=32 | 134.33M params | algo3-hadamard] 1.102 s/epoch, peak 3922 MiB
+Saved /home/arsenii/jd-phase25-bench/results_extensive/g0/scaling_cifar10.png

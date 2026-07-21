@@ -4,5 +4,6 @@
   "preflight": true,
   "engines": true,
   "decompose": true,
-  "scaling": true
+  "scaling": true,
+  "profile": true
 }

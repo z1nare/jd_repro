@@ -1,130 +1,340 @@
-# Results — IWRM benchmarks and TorchJD profiling (CIFAR-10)
+# Results — IWRM Benchmarks and Gramian Engine Comparison (CIFAR-10)
 
-Reproduction of the small-scale IWRM experiments from *Jacobian Descent for
-Multi-Objective Optimization* (arXiv:2406.16232v3), plus engine-level profiling
-and custom Hadamard Gramian algorithm testing of TorchJD 0.17.0. All raw data (JSON), plots, and per-step logs are in
-[`results/`](results/).
+Independent reproduction of the small-scale IWRM experiments from
+[*Jacobian Descent for Multi-Objective Optimization*](https://arxiv.org/abs/2406.16232)
+(arXiv:2406.16232v3), followed by a capacity and timing comparison of TorchJD’s
+execution engines against a custom Hadamard Gramian implementation
+([`hadamard.py`](hadamard.py)).
 
-**Environment:** University SLURM Cluster (`landonia` nodes), NVIDIA GeForce RTX 2080 Ti (11 GB VRAM), torch 2.6.0+cu124, TorchJD 0.17.0, Python 3.12.3. See [`results/env.json`](results/env.json).
-
-**Protocol** (matching the paper's Appendix D unless noted):
-
-- Architecture: the CIFAR-10 CNN from Table 3, verbatim (including the grouped
-  convolutions), ELU activations, PyTorch default init.
-- Data: 1024-image seeded subset, batch size 32, per-channel normalization
-  computed on the full training split (D.6). The whole subset is preloaded to
-  GPU, so timings contain no dataloader noise.
-- Optimization: plain SGD, no momentum (D.4); cross-entropy with
-  `reduction='none'`, i.e. 32 objectives per step (IWRM via SSJD).
-- Learning rate: selected per aggregator by area under the loss curve, the
-  paper's D.1 criterion, over an extended 9-point grid (3e-4 … 3.0).
-- Determinism: subset indices, model init `state_dict`, and per-epoch batch
-  order are seeded and shared across all aggregators and engines.
-- Timing: 3 warmup epochs, then ≥10 timed epochs bracketed by
-  `torch.cuda.synchronize()`; memory via `reset_peak_memory_stats` /
-  `max_memory_allocated`.
-
-Before any benchmark, `preflight` verifies that the `autojac` path, native `autogram` path, and custom `algo3-hadamard` implementation produce identical updates: after a multi-step trajectory from identical init, the max parameter difference was **1.64e-07** (tolerance 5e-4).
+**Primary results:** fuji2, 21 July 2026.  
+**Raw artifacts:** [`results_extensive_fuji2/`](results_extensive_fuji2/),
+[`results_w106_112/`](results_w106_112/).  
+**Figures used below:** [`results/`](results/).
 
 ---
 
-## 1. Figure 2 reproduction (convergence & 50-epoch stress test)
+## Environment and protocol
+
+| | |
+|---|---|
+| Host | fuji2 — 4× NVIDIA RTX A5000 (24 GB) |
+| Software | Python 3.10.20, PyTorch 2.4.1+cu121, TorchJD 0.17.x |
+| GPU state before sweep | idle (~5 MiB used on each card) |
+
+Earlier laptop (5070 Ti) and landonia (2080 Ti) runs are superseded for capacity
+and engine timing. They remain useful only as evidence that TorchJD engines
+already exhaust smaller GPUs.
+
+**Protocol** (paper Appendix D unless noted):
+
+- Architecture: CIFAR-10 CNN (Table 3), including grouped convolutions and ELU
+- Data: 1024-image seeded subset, batch size 32, full-train-set channel
+  normalisation (D.6); subset preloaded to GPU
+- Optimiser: plain SGD without momentum (D.4); cross-entropy with
+  `reduction='none'` (32 IWRM objectives per step)
+- Learning rate: per-aggregator sweep by area under the loss curve (D.1),
+  grid `0.0003 … 0.3`
+- Timing: warmup + timed epochs bracketed by `cuda.synchronize()`; peak
+  memory via `max_memory_allocated`
+- Width multiplier `w` scales channel counts (and groups); `w = 1` is the
+  paper architecture (~0.13M parameters)
+
+**Preflight (4/4 gates passed on fuji2):**
+
+1. UPGrad / UPGradWeighting `pref_vector` defaults match
+2. `autogram` accepts the paper CNN; Gramian shape `(32, 32)`
+3. autojac vs autogram multi-step trajectory: max parameter difference
+   **2.0×10⁻⁶** (tolerance 5×10⁻⁴)
+4. Custom `algorithm3` Gramian matches `autogram` (relative tolerance 10⁻⁴)
+
+Engine comparisons below therefore use **equivalent update directions**, not
+different aggregators.
+
+---
+
+## 1. Gramian computation paths
+
+Jacobian Descent forms aggregator weights from the Gramian
+
+$$G = J J^{\top} \in \mathbb{R}^{m \times m},$$
+
+where each row of $J$ is the gradient of one objective with respect to the
+parameters. Four practical ways to obtain $G$ are distinguished below.
+
+### Path A — Full Jacobian materialisation (`autojac`)
+
+TorchJD builds $J \in \mathbb{R}^{m \times P}$ explicitly (`backward` +
+`jac_to_grad`) and then aggregates. Peak memory is dominated by the full
+$m \times P$ block. This is the most direct autodiff formulation and the first
+to fail as $P$ grows.
+
+### Path B — VJP / hook-based Gramian (`autogram`)
+
+TorchJD’s memory-oriented engine. The full end-to-end Jacobian is never
+stored; during the backward pass, per-layer blocks
+$J_{\ell} \in \mathbb{R}^{m \times P_{\ell}}$ are materialised (hooks /
+`vmap`+`vjp`-style work) and accumulated as
+
+$$G \leftarrow G + J_{\ell} J_{\ell}^{\top}.$$
+
+Peak memory tracks the **largest layer**, $\mathcal{O}(m \cdot P_{\ell,\max})$,
+rather than total parameter count. This is substantially more efficient than
+Path A, but still linear in the widest layer.
+
+### Path C — Column-wise / recursive Algorithm 3
+
+The paper’s Algorithm 3 walks layers in reverse, maintains an upstream
+gradient $A$, and accumulates layer contributions without forming a global
+$J$. For a Linear layer with per-example outer products
+$J_{W,i} = a_i x_i^{\top}$, a column-wise expansion of the Gramian is
+
+$$G = \sum_{k=1}^{P_{\ell}} j_k j_k^{\top},$$
+
+where $j_k$ is the $k$-th column of $J_{\ell}$. The identity is correct, but a
+naive Python implementation (including an early per-group Conv2d loop) issues
+a large number of tiny kernels and becomes dispatch-bound on GPU.
+
+### Path D — Hadamard factorisation (`algo3-hadamard`)
+
+For Linear weights, the outer-product structure yields
+
+$$J_{W,i} = a_i x_i^{\top}
+\quad\Rightarrow\quad
+G_W = (A A^{\top}) \odot (X X^{\top}),$$
+
+so $J_W$ is never allocated: only two $m \times m$ products and an
+element-wise multiply. The bias term is $G_b = A A^{\top}$; upstream
+propagation is $A \leftarrow A W$.
+
+For grouped Conv2d, a compact per-example weight-Jacobian block is still
+formed (unfold + one batched matmul over groups), then
+$G \leftarrow G + J J^{\top}$. Vectorising the former per-group Python loop
+removed the dispatch overhead that previously made Path C unusable at scale.
+
+**Memory scaling.** On this CNN, parameters are dominated by
+`Linear(1024w, 128w)` ($\propto w^{2}$). That layer’s Gramian cost under Path D
+is $\mathcal{O}(m^{2})$, independent of its parameter count, which explains
+the observed sub-linear growth of peak memory in $P$ (e.g. $w=32\to 64$:
+~4× parameters, ~2.5× peak MiB).
+
+**Current scope limits of Path D:**
+
+- IWRM-shaped per-instance losses (row $i$ of $A$ corresponds to instance $i$).
+  Batch-mixing layers such as BatchNorm invalidate that assumption.
+- Manual reverse traversal of `nn.Sequential` only (Conv2d, Linear, ELU,
+  MaxPool2d, Flatten). Residuals, attention, and LayerNorm are not yet
+  supported.
+- Multi-objective RL with batch-averaged component losses requires a different
+  identity; that derivation is pending confirmation of the loss construction.
+
+---
+
+## 2. Figure 2 — aggregator convergence
 
 ![Figure 2](results/figure2_cifar10.png)
 
-Qualitative match with the paper's Figure 2c, extended to 50 epochs to find the optimization ceiling:
+Learning-rate sweep on fuji2 (AUC = sum of per-step mean cross-entropy;
+paper D.1 criterion):
 
-- **UPGrad** (lr 0.3) converges fastest and lowest, achieving an Area Under Curve (AUC) of **376.54**, clearly beating the **Mean** baseline (AUC 493.53) — reproducing the paper's headline result over long horizons.
-- **PCGrad** (lr 0.0003) diverges to NaN at every lr ≥ 0.001. This confirms its mathematical definition: PCGrad **sums** the m projected gradients (paper Eq. 33) where UPGrad **averages** them (Eq. 4). At m = 32, the update compounds massively over 50 epochs, causing explosive divergence unless constrained to a microscopic learning rate.
-- **MGDA** (lr 0.03) performs poorly (AUC ~2978), confirming its severe sensitivity to small gradients which causes it to stall at weakly-stationary points.
-
-## 2. Table 7 timing ratios
-
-| Method | s/epoch (ours) | ratio, Mean = 1 (ours) | ratio (paper, L4) |
+| Aggregator | Selected lr | AUC | Notes |
 |---|---|---|---|
-| SGD (ERM scalar) | 0.145 ± 0.000 | 0.28 | 0.28 |
-| Mean | 0.520 ± 0.000 | 1.00 | 1.00 |
-| UPGrad | 0.788 ± 0.006 | 1.51 | 1.14 |
-| PCGrad | 1.923 ± 0.002 | 3.70 | 1.78 |
-| MGDA | 2.202 ± 0.656 | 4.23 | 2.97 |
+| Mean | 0.3 | 494.72 | Grid endpoint |
+| UPGrad | 0.3 | 380.68 | Grid endpoint; lowest AUC |
+| PCGrad | 0.003 | 575.01 | Diverges for every lr ≥ 0.01 |
+| MGDA | 0.1 | 1263.68 | Weak / stalled learning |
 
-Ratios are compared rather than absolute times. Ordering matches the paper exactly (SGD < Mean < UPGrad < PCGrad < MGDA). The scalar SGD baseline ratio here exactly matches the paper's 0.28. MGDA's large variance reflects its iterative Frank–Wolfe-style QP solve.
+**Findings**
 
-## 3. Engine comparison — autojac vs autogram vs Custom Hadamard
+- UPGrad outperforms Mean on AUC (381 vs 495), matching the paper’s qualitative
+  CIFAR-10 result and validating the harness before engine work.
+- PCGrad sums projected gradients (paper Eq. 33) rather than averaging them;
+  at $m = 32$ the update magnitude is unstable unless the learning rate is
+  kept very small.
+- MGDA underperforms, consistent with known sensitivity to small gradients.
 
-![Engines](results/engines_cifar10.png)
-
-Same UPGrad weights on all paths (verified by preflight), same data order:
-
-| Config | s/epoch | peak MiB |
-|---|---|---|
-| SGD (ERM scalar) | 0.148 ± 0.000 | 53.5 |
-| autojac + UPGrad | 0.793 ± 0.007 | 601.6 |
-| autojac + UPGrad (`optimize_gramian_computation=True`) | 0.824 ± 0.008 | 601.6 |
-| autogram + UPGradWeighting | 1.062 ± 0.018 | 82.2 |
-| algo3-hadamard + UPGradWeighting | 2.700 ± 0.008 | 143.5 |
-
-- **autojac vs autogram:** Native autogram radically reduces memory (601 MiB -> 82 MiB) as expected. 
-- **The algo3-hadamard speed penalty:** While mathematically equivalent, the custom algorithm is ~2.5x slower than native autogram at baseline. The scaling tests below reveal the exact source of this dispatch bottleneck.
-
-## 4. Step decomposition (where the time goes)
-
-![Decomposition](results/decompose_cifar10.png)
-
-One autogram step split into forward / gramian_pass / weighting_qp / backward_step, across batch size m (= number of objectives) and model width.
-QP share of total epoch time:
-
-| width (params) | m=4 | m=8 | m=16 | m=32 | m=64 |
-|---|---|---|---|---|---|
-| 1 (0.13M) | 9.1% | 11.4% | 17.1% | 36.8% | 76.4% |
-| 4 (2.11M) | 9.1% | 11.4% | 17.1% | 37.3% | 73.5% |
-| 8 (8.42M) | 9.0% | 11.3% | 17.1% | 32.9% | 59.4% |
-
-At small m (4–8), the QP share shrinks as the parameter count grows, while `gramian_pass` dominates the step outright. At large m (64), the O(m^3) or O(m^4) sequential CPU cost of the QP solver dominates (76.4%), proving that scaling objective counts requires batched GPU solvers.
-
-## 5. Memory scaling & The LLM Implication (w=16 Stress Test)
-
-![Scaling](results/scaling_cifar10.png)
-
-Stress-testing the 11 GB RTX 2080 Ti limits across widths reveals the true advantage of the custom `algo3-hadamard` implementation.
-
-| width | params | autojac peak | autogram peak | algo3-hadamard peak |
-|---|---|---|---|---|
-| 1 | 0.13M | 602 MiB | 82 MiB | 143 MiB |
-| 2 | 0.53M | 1206 MiB | 202 MiB | 274 MiB |
-| 4 | 2.11M | 2515 MiB | 634 MiB | 516 MiB |
-| 8 | 8.42M | 5529 MiB | 2278 MiB | 1014 MiB |
-| **16** | **33.61M** | **OOM** | **8686 MiB** | **2056 MiB** |
-| 32 | ~134M | OOM | OOM | Untested |
-
-**Key Finding — A 4x Memory Victory:**
-At width=16 (33.6 million parameters):
-1. Native `autojac` instantly **OOMs**, exceeding 11 GB by trying to materialize the full $m \times P$ Jacobian.
-2. Native `autogram` survives, but peaks at **8.6 GB**.
-3. The custom `algo3-hadamard` algorithm mathematically restructures the Gramian accumulation to bypass intermediate Jacobian blocks, requiring only **2.05 GB** of VRAM.
-
-**LLM Implication:** This proves that the Hadamard trace approach scales dramatically better in memory footprint. A 4x reduction in peak memory usage over native `autogram` makes applying multi-objective Jacobian Descent (e.g., RLHF across helpfulness/harmlessness/verbosity metrics) highly viable on constrained hardware for Large Language Models.
-
-## 6. The Gramian Pass Issue: Python Loop Overhead
-
-While `algo3-hadamard` uses 4x less memory, its execution time scales poorly compared to native `autogram` (36.6s vs 2.25s at w=16). 
-
-The profiler and scaling data trace this directly to a **CPU kernel-launch starvation issue**, primarily in the grouped convolution logic.
-
-**The Bottleneck:**
-To accumulate the Hadamard product across grouped convolutions, the initial implementation uses a Python `for g in range(G):` loop.
-- At w=16, the network requires $G = 512$ groups for certain layers.
-- For a single forward/backward pass, the host CPU must dynamically dispatch thousands of micro-kernels (`unfold`, `matmul`, `add`) per layer.
-- The GPU executes the math almost instantly (< 1µs) but is starved while waiting for the PyTorch Python/C++ boundary to dispatch the next group.
-
-**Resolution Path:**
-The immediate fix requires vectorizing the convolution loop. By using `torch.reshape(m, G, ...)` and a single batched `matmul`, the CPU-to-GPU dispatch overhead will drop from $O(G)$ to $O(1)$ per layer, theoretically closing the speed gap with `autogram` while retaining the massive 4x memory reduction. The ultimate optimization is a fused Triton kernel.
+**Caveat.** Mean and UPGrad both select the top of the tested grid; a wider
+grid may shift the absolute optimum. Ordering, not absolute lr, is the
+relevant check for this reproduction.
 
 ---
 
-## Remaining experiments
+## 3. Table 7 — per-aggregator timing ratios
 
-- Vectorize `algo3-hadamard` batched matrix multiplications to eliminate the Python dispatch bottleneck.
-- Implement fused Triton kernel for the Hadamard trace.
-- Multi-seed reruns (8 seeds, SEM bands) to match the paper's final protocol.
-- Step decomposition at larger N and on a non-CNN architecture (small transformer).
+| Method | s/epoch (fuji2) | Ratio (Mean = 1) | Paper ratio (L4, Mean = 1) |
+|---|---|---|---|
+| SGD-ERM | 0.033 ± 0.001 | 0.09 | 0.28 |
+| Mean | 0.355 ± 0.002 | 1.00 | 1.00 |
+| UPGrad | 0.449 ± 0.003 | 1.26 | 1.14 |
+| PCGrad | 0.741 ± 0.003 | 2.08 | 1.78 |
+| MGDA | 0.940 ± 0.228 | 2.64 | 2.97 |
+
+Source: [`results/table7_cifar10.md`](results/table7_cifar10.md).
+
+Ordering matches the paper (SGD < Mean < UPGrad < PCGrad < MGDA). Absolute
+times differ across GPUs and TorchJD versions; **ratios** are the appropriate
+comparison. UPGrad/Mean (1.26 vs 1.14) is close to the published figure.
+MGDA’s large standard deviation is consistent with its iterative QP solve.
+
+---
+
+## 4. Engine comparison at paper scale ($w = 1$)
+
+![Engines](results/engines_cifar10.png)
+
+Same UPGrad weights, same data order, batch 32:
+
+| Configuration | Path | s/epoch | Peak MiB |
+|---|---|---|---|
+| SGD-ERM (scalar) | baseline | 0.039 | 54 |
+| autojac + UPGrad | A | 0.448 | 602 |
+| autojac + UPGrad (`optimize_gramian`) | A | 0.456 | 602 |
+| autogram + UPGradWeighting | B | 0.327 | 82 |
+| algo3-hadamard + UPGradWeighting | D | **0.201** | **134** |
+
+**Findings**
+
+1. **Path B vs Path A.** `autogram` uses approximately 7× less peak memory than
+   `autojac` (82 vs 602 MiB) and is faster (0.33 vs 0.45 s/epoch).
+2. **`optimize_gramian_computation`.** No memory benefit on this model at
+   paper width; slightly slower. Not pursued further.
+3. **Path D vs Path B.** At paper scale, the Hadamard engine is **faster**
+   than `autogram` (0.20 vs 0.33 s/epoch) with a modest memory premium
+   (134 vs 82 MiB). Earlier reports that Hadamard was ~2.5× slower referred to
+   a pre-vectorisation Conv2d loop and do not apply to the current code.
+
+---
+
+## 5. Step-time decomposition (`autogram`)
+
+![Decomposition](results/decompose_cifar10.png)
+
+One `autogram` step is split into `forward`, `gramian_pass`, `weighting_qp`,
+and `backward_step` across objective count $m$ (batch size) and model width.
+
+QP share of epoch time (fuji2):
+
+| Width (params) | $m=4$ | $m=8$ | $m=16$ | $m=32$ | $m=64$ |
+|---|---|---|---|---|---|
+| 1 (0.13M) | 8.5% | 10.3% | 14.5% | 32.3% | 77.1% |
+| 4 (2.11M) | 8.4% | 10.0% | 14.2% | 27.7% | 63.6% |
+| 8 (8.42M) | 7.9% | 9.2% | 9.5% | 15.4% | 41.5% |
+
+At RL-relevant objective counts ($m = 4$–$16$), Gramian accumulation dominates
+and the QP share remains secondary, especially as width increases. At
+$m = 64$, sequential CPU QP solving dominates (up to 77%). GPU-resident /
+batched QP work (e.g. via jacopt) is therefore relevant for large $m$, but it
+is not the reason Path D outperforms Path B at $m = 32$.
+
+Synced wall-clock segments at $w=8$, $m=32$ agree: Hadamard’s fused
+forward+Gramian cost is roughly half of `autogram`’s `gramian_pass`
+(~5.7 ms vs ~13.7 ms per step). Profiler-reported peak memory (~15 GB) is
+inflated relative to clean `scaling` measurements; **scaling peak MiB is
+treated as ground truth**, with profiler output used for operator timelines
+only.
+
+---
+
+## 6. Memory and capacity scaling
+
+Merged measurements (fuji2 A5000 24 GB, UPGrad, batch 32):
+[`results/scaling_cifar10.json`](results/scaling_cifar10.json).
+
+**Shared widths (all three engines; $w \le 32$):**
+
+![Scaling through w=32](results/scaling_cifar10_lowwidths.png)
+
+**Full successful range (log-$x$; Hadamard through $w=112$):**
+
+![Scaling full range](results/scaling_cifar10.svg)
+
+| Width | Params | autojac (A) | autogram (B) | algo3-hadamard (D) |
+|---|---|---|---|---|
+| 1 | 0.13M | 0.44 s / 602 MiB | 0.30 s / 82 MiB | **0.19 s / 134 MiB** |
+| 2 | 0.53M | 0.77 s / 1206 MiB | 0.31 s / 203 MiB | **0.21 s / 239 MiB** |
+| 4 | 2.11M | 1.49 s / 2515 MiB | 0.35 s / 633 MiB | **0.23 s / 407 MiB** |
+| 8 | 8.42M | 3.12 s / 5530 MiB | 0.62 s / 2278 MiB | **0.33 s / 816 MiB** |
+| 16 | 33.6M | 7.18 s / 13140 MiB | 1.63 s / 8686 MiB | **0.57 s / 1722 MiB** |
+| 32 | 134M | **OOM** | **OOM** | **1.10 s / 3922 MiB** |
+| 64 | 537M | — | — | **2.46 s / 9856 MiB** |
+| 96 | 1.21B | — | — | **4.56 s / 17839 MiB** |
+| 106 | 1.47B | — | — | **4.92 s / 20754 MiB** |
+| **112** | **1.65B** | — | — | **5.32 s / 22598 MiB** |
+| 128 | 2.15B | — | — | **OOM** |
+
+**Findings**
+
+1. **TorchJD ceiling (24 GB).** Paths A and B both OOM at $w=32$ (134M
+   parameters). The last successful TorchJD width is $w=16$ (33.6M).
+2. **Hadamard ceiling (24 GB).** Last success: $w=112$ (1.65B parameters,
+   22.6 GB peak). First failure: $w=128$. Relative to TorchJD’s first-fail
+   width this is approximately **12×** more parameters; relative to TorchJD’s
+   last success, approximately **49×**. The conservative figure quoted below
+   is **12×**.
+3. **Speed on shared widths.** Path D is faster than Paths A and B at every
+   width where all three complete. At $w=16$: 0.57 s/epoch vs 1.63 s/epoch
+   for `autogram` (~3×).
+4. **Memory at $w=16$.** Path D: 1.7 GB; Path B: 8.7 GB; Path A: 13.1 GB.
+5. **Interpretation for LLM-scale discussion.** 1.65B parameters on this
+   width-scaled CNN is a **Gramian-path capacity stress test**, not a claim
+   that a 1.7–2B transformer can already be trained with this code. The
+   parameter-count comparison is still informative for multi-objective JD
+   on Linear-dominated models.
+
+OOM rows for `autogram` ($w=32/64/128$) and Hadamard ($w=128$) were recorded
+cleanly by the profile harness
+([`results_extensive_fuji2/g3/profile_cifar10_summary.json`](results_extensive_fuji2/g3/profile_cifar10_summary.json)).
+
+---
+
+## 7. Caveats
+
+- **Single seed** (seed = 1). The paper reports eight seeds with SEM bands.
+  Qualitative aggregator ordering is sufficient for engine decisions; paper-
+  strict claims require multi-seed runs.
+- **Learning-rate grid endpoints** for Mean and UPGrad — the true optimum may
+  lie above 0.3.
+- **PCGrad NaNs** at high learning rates are expected from the algorithm, not
+  a harness defect.
+- **Architecture** is a width-scaled paper CNN, not a transformer.
+- **Profiler peak memory ≠ scaling peak memory.** Use scaling for MiB figures.
+- **IWRM ≠ RL loss.** Extending the Hadamard identity to batch-averaged
+  multi-component RL objectives remains open.
+- Earlier laptop / landonia timing documents that described Hadamard as slow
+  are **obsolete** for the vectorised implementation.
+
+---
+
+## 8. Next steps
+
+**Completed for this report:** fuji2 extensive sweep, $w=106/112$ ceiling
+probe, preflight 4/4, removal of multi-GB init checkpoints from the cluster.
+
+**Near term**
+
+1. Confirm the RL **loss construction** (per-instance vs per-component
+   batch-averaged) and target $m$ / batch size, then derive the corresponding
+   Gramian identity.
+2. Triton fused kernel for $(A A^{\top})\odot(X X^{\top})$.
+3. GPU-resident / batched dual-cone QP via [jacopt](https://github.com/rzhu3/jacopt).
+   At small $m$ this is not the dominant cost; it remains worthwhile as a
+   collaborative, bounded improvement to the CPU round-trip.
+4. Optional: Perfetto busy-ratio on
+   `results_extensive_fuji2/g3/profile_algo3-hadamard_w64_trace.json`.
+5. SVHN pass and multi-seed runs when paper-strict reproduction is required.
+
+**Later.** Extend layer coverage beyond `nn.Sequential`; integrate into the
+RL training stack once the call site (losses → UPGrad → Adam) is fixed.
+
+---
+
+## Appendix — artifacts
+
+| Artifact | Location |
+|---|---|
+| Fuji2 sweep log | `results_extensive_fuji2/extensive_20260721_133325.log` |
+| Merged scaling JSON | `results/scaling_cifar10.json` |
+| Engines / Figure 2 / decompose | `results/*.png`, `results/*.json` |
+| Full-range scaling figure | `results/scaling_cifar10.svg` |
+| $w=106/112$ probe | `results_w106_112/` |
+| Profile summary and traces | `results_extensive_fuji2/g3/` |
+| Implementation | `hadamard.py`, `iwrm_bench.py` |

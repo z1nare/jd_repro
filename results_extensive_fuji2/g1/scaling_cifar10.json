@@ -1,0 +1,1 @@
+{"autojac": [], "autogram": [], "algo3-hadamard": [{"width": 64, "params": 537100298, "s_per_epoch": 2.458776188393434, "peak_mib": 9856.3046875}, {"width": 96, "params": 1208303626, "s_per_epoch": 4.561098346486688, "peak_mib": 17838.70849609375}, {"width": 128, "params": 2147942410, "oom": true}]}

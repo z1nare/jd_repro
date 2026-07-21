@@ -1,49 +1,49 @@
 # TorchJD IWRM benchmarks — CIFAR-10
 
-Benchmarking and profiling suite for [TorchJD](https://github.com/TorchJD/torchjd)
-(v0.17.0) on the instance-wise risk minimization (IWRM) setting of
+Independent reproduction and profiling harness for
+[TorchJD](https://github.com/TorchJD/torchjd) on the IWRM setting of
 [*Jacobian Descent for Multi-Objective Optimization*](https://arxiv.org/abs/2406.16232)
-(arXiv:2406.16232v3).
+(arXiv:2406.16232v3), plus a custom Gramian engine (`algo3-hadamard`).
 
-Goal: validate the paper's published results (Figure 2 convergence ordering,
-Table 7 timing ratios) with an independent harness, then use that validated
-harness to compare TorchJD's two execution engines (autojac vs autogram) and
-isolate the computational bottleneck (QP solve vs Gramian accumulation).
+Full write-up: **[RESULTS.md](RESULTS.md)**. Raw fuji2 artifacts:
+[`results_extensive_fuji2/`](results_extensive_fuji2/),
+[`results_w106_112/`](results_w106_112/).
 
-## Key findings
+## Key findings (fuji2, RTX A5000 24 GB)
 
-Full write-up with plots, tables, caveats, and remaining work:
-**[RESULTS.md](RESULTS.md)**.
-
-- **Convergence:** UPGrad beats Mean, matching the paper. MGDA never learns
-  (consistent with its known small-gradient pathology). PCGrad diverges at
-  lr ≥ 0.01 and needs a ~100x smaller lr than UPGrad.
-- **Engines:** autogram is ~2x faster (1.8–1.95x across sessions) and uses
-  7.25x less peak memory than autojac for identical UPGrad updates (update
-  equivalence asserted to ~6e-8).
-- **Bottleneck:** at 4–8 objectives, the QP solve is ≤ 3% of step time on the
-  larger models, while the Gramian accumulation pass dominates. The QP only
-  becomes significant at large objective counts (69% at m = 64).
+- **Convergence:** UPGrad beats Mean (AUC 381 vs 495). PCGrad diverges at
+  lr ≥ 0.01. MGDA learns poorly — same qualitative story as the paper.
+- **Engines at paper scale:** `algo3-hadamard` is the **fastest** path
+  (0.20 s/epoch) vs `autogram` (0.33) and `autojac` (0.45), with modest
+  memory vs autogram (134 vs 82 MiB).
+- **Capacity:** TorchJD `autojac` / `autogram` OOM at **134M params** (w=32).
+  Hadamard runs to **1.65B params** (w=112, 22.6 GB peak) — about **12×**
+  TorchJD’s ceiling on the same card — then OOM at w=128.
+- **Bottleneck:** at small objective counts (m=4–16), Gramian accumulation
+  dominates; QP share is secondary. At m=64 the sequential QP dominates.
 
 ## Running
 
 ```bash
 pip install -r requirements.txt
 
-python run_all.py --quick     # 5-10 min sanity pass
-python run_all.py             # full suite, ~60-90 min on a 12 GB GPU
-python iwrm_bench.py --help   # individual subcommands
+python run_all.py --quick     # short sanity pass
+python run_all.py             # full suite (laptop-safe widths)
+python iwrm_bench.py --help
 ```
 
-Outputs (plots, JSON, ratio table, per-step logs, `env.json`) land in
-`results/`. Every run starts with a `preflight` step that asserts
-autojac/autogram update equivalence before any benchmark is trusted.
+On a 24 GB GPU, push hadamard alone:
 
-Note: the `scaling` step is capped at width 8. Width 16 needs > 12 GB for the
-autojac path and crashed the GPU driver on the 12 GB test machine; run it only
-on a GPU with ≥ 16 GB.
+```bash
+python iwrm_bench.py scaling --dataset cifar10 \
+  --widths 96 106 112 --engines algo3-hadamard --warmup 2 --timed 3
+```
 
-## Environment used for the reported results
+Every trusted suite starts with `preflight` (autojac / autogram / hadamard
+equivalence).
 
-RTX 5070 Ti Laptop GPU (12 GB), torch 2.10 nightly (cu128), TorchJD 0.17.0,
-Python 3.11 — see `results/env.json`.
+## Environments
+
+- **Reported here:** fuji2, 4× A5000 24 GB, torch 2.4.1+cu121, Python 3.10
+- Cluster torch pins may differ from `requirements.txt` (`torch>=2.7` for
+  laptop); pin CUDA wheels to match the host driver when needed.

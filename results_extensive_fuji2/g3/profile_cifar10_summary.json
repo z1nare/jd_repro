@@ -1,0 +1,78 @@
+[
+  {
+    "engine": "autogram",
+    "width": 8,
+    "params": 8417290,
+    "wall_ms": 21.41436580568552,
+    "peak_mib": 15945.67919921875,
+    "segments": {
+      "forward": 1813.1718039512634,
+      "gramian_pass": 13697.047531604767,
+      "weighting_qp": 3036.1641198396683,
+      "backward_step": 2830.5763378739357
+    }
+  },
+  {
+    "engine": "algo3-hadamard",
+    "width": 8,
+    "params": 8417290,
+    "wall_ms": 11.615665443241596,
+    "peak_mib": 15753.2021484375,
+    "segments": {
+      "forward": 0.0,
+      "gramian_pass": 5669.780448079109,
+      "weighting_qp": 2985.289506614208,
+      "backward_step": 2867.8646311163902
+    }
+  },
+  {
+    "engine": "autogram",
+    "width": 32,
+    "params": 134332426,
+    "oom": true
+  },
+  {
+    "engine": "algo3-hadamard",
+    "width": 32,
+    "params": 134332426,
+    "wall_ms": 34.45879556238651,
+    "peak_mib": 3923.583984375,
+    "segments": {
+      "forward": 0.0,
+      "gramian_pass": 18937.64305859804,
+      "weighting_qp": 2703.854814171791,
+      "backward_step": 12722.952663898468
+    }
+  },
+  {
+    "engine": "autogram",
+    "width": 64,
+    "params": 537100298,
+    "oom": true
+  },
+  {
+    "engine": "algo3-hadamard",
+    "width": 64,
+    "params": 537100298,
+    "wall_ms": 78.82704827934504,
+    "peak_mib": 9858.43017578125,
+    "segments": {
+      "forward": 0.0,
+      "gramian_pass": 40999.908186495304,
+      "weighting_qp": 3960.010968148709,
+      "backward_step": 33769.553154706955
+    }
+  },
+  {
+    "engine": "autogram",
+    "width": 128,
+    "params": 2147942410,
+    "oom": true
+  },
+  {
+    "engine": "algo3-hadamard",
+    "width": 128,
+    "params": 2147942410,
+    "oom": true
+  }
+]

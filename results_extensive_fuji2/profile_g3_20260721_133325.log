@@ -1,0 +1,75 @@
+/home/arsenii/jd-phase25-bench/iwrm_bench.py:143: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  idx = torch.load(idx_file)
+Files already downloaded and verified
+** WARNING: --widths includes 128 (>4). Profiler overhead stacks on top of your machine's known width=16 DPC_WATCHDOG crash. Watch `nvidia-smi -l 1` in another terminal, or lower --widths. **
+
+======================================================================
+autogram width=8 (8.42M params) m=32 device=cuda
+======================================================================
+wall time/step: 21.41 ms   peak memory: 15945.7 MiB
+segment breakdown (per step, synced wall clock, post profiler-warmup):
+  forward                   1813.2 us
+  gramian_pass             13697.0 us
+  weighting_qp              3036.2 us
+  backward_step             2830.6 us
+top ops by self time: aten::convolution_backward(49199us), aten::mm(42178us), aten::cat(38540us)
+full tables: /home/arsenii/jd-phase25-bench/results_extensive/g3/profile_autogram_w8_{time,memory,shapes}.txt
+trace: /home/arsenii/jd-phase25-bench/results_extensive/g3/profile_autogram_w8_trace.json  (open in https://ui.perfetto.dev)
+
+======================================================================
+algo3-hadamard width=8 (8.42M params) m=32 device=cuda
+======================================================================
+wall time/step: 11.62 ms   peak memory: 15753.2 MiB
+segment breakdown (per step, synced wall clock, post profiler-warmup):
+  forward                      0.0 us  (n/a -- fused into gramian_pass for this engine)
+  gramian_pass              5669.8 us
+  weighting_qp              2985.3 us
+  backward_step             2867.9 us
+top ops by self time: fused_forward_gramian(66757us), aten::convolution_backward(20236us), aten::im2col(13007us)
+full tables: /home/arsenii/jd-phase25-bench/results_extensive/g3/profile_algo3-hadamard_w8_{time,memory,shapes}.txt
+trace: /home/arsenii/jd-phase25-bench/results_extensive/g3/profile_algo3-hadamard_w8_trace.json  (open in https://ui.perfetto.dev)
+[autogram w=32] OOM (recorded)
+
+======================================================================
+algo3-hadamard width=32 (134.33M params) m=32 device=cuda
+======================================================================
+wall time/step: 34.46 ms   peak memory: 3923.6 MiB
+segment breakdown (per step, synced wall clock, post profiler-warmup):
+  forward                      0.0 us  (n/a -- fused into gramian_pass for this engine)
+  gramian_pass             18937.6 us
+  weighting_qp              2703.9 us
+  backward_step            12723.0 us
+top ops by self time: fused_forward_gramian(225699us), aten::convolution_backward(79146us), void at::native::(anonymous namespace)::conv_depthwise2d_backward_kernel<3, 1, float, int>(at::GenericPackedTensorAccessor<float const, 4ul, at::DefaultPtrTraits, int>, at::GenericPackedTensorAccessor<float, 4ul, at::DefaultPtrTraits, int>, at::GenericPackedTensorAccessor<float const, 4ul, at::DefaultPtrTraits, int>, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int)(42297us)
+full tables: /home/arsenii/jd-phase25-bench/results_extensive/g3/profile_algo3-hadamard_w32_{time,memory,shapes}.txt
+trace: /home/arsenii/jd-phase25-bench/results_extensive/g3/profile_algo3-hadamard_w32_trace.json  (open in https://ui.perfetto.dev)
+[autogram w=64] OOM (recorded)
+
+======================================================================
+algo3-hadamard width=64 (537.10M params) m=32 device=cuda
+======================================================================
+wall time/step: 78.83 ms   peak memory: 9858.4 MiB
+segment breakdown (per step, synced wall clock, post profiler-warmup):
+  forward                      0.0 us  (n/a -- fused into gramian_pass for this engine)
+  gramian_pass             40999.9 us
+  weighting_qp              3960.0 us
+  backward_step            33769.6 us
+top ops by self time: fused_forward_gramian(490461us), aten::convolution_backward(163473us), aten::mm(130487us)
+full tables: /home/arsenii/jd-phase25-bench/results_extensive/g3/profile_algo3-hadamard_w64_{time,memory,shapes}.txt
+trace: /home/arsenii/jd-phase25-bench/results_extensive/g3/profile_algo3-hadamard_w64_trace.json  (open in https://ui.perfetto.dev)
+[autogram w=128] OOM (recorded)
+[algo3-hadamard w=128] OOM (recorded)
+
+======================================================================
+Table E -- profile sweep summary
+======================================================================
+          engine | width |  params(M) |  wall ms/step |  peak MiB |  gramian % |    qp %
+        autogram |     8 |       8.42 |         21.41 |   15945.7 |      64.1% |   14.2%
+  algo3-hadamard |     8 |       8.42 |         11.62 |   15753.2 |      49.2% |   25.9%
+        autogram |    32 |     134.33 |           OOM |         - |         - |      -
+  algo3-hadamard |    32 |     134.33 |         34.46 |    3923.6 |      55.1% |    7.9%
+        autogram |    64 |     537.10 |           OOM |         - |         - |      -
+  algo3-hadamard |    64 |     537.10 |         78.83 |    9858.4 |      52.1% |    5.0%
+        autogram |   128 |    2147.94 |           OOM |         - |         - |      -
+  algo3-hadamard |   128 |    2147.94 |           OOM |         - |         - |      -
+
+Saved /home/arsenii/jd-phase25-bench/results_extensive/g3/profile_cifar10_summary.json
