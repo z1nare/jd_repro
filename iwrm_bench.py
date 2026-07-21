@@ -630,110 +630,151 @@ def cmd_profile(args, device, out, X, Y):
         print(f"** WARNING: --widths includes {max(args.widths)} (>4). Profiler overhead "
               f"stacks on top of your machine's known width=16 DPC_WATCHDOG crash. Watch "
               f"`nvidia-smi -l 1` in another terminal, or lower --widths. **")
-
+ 
     activities = [ProfilerActivity.CPU]
     if device.type == "cuda":
         activities.append(ProfilerActivity.CUDA)
     seg_names = set(SEGMENTS)
-
+ 
     summary_rows = []
     for w in args.widths:
-        args.width = w
-        model, opt, engine, weighting = _build_autogram(args.dataset, args.seed, out, w, device, args.lr)
-        n_params = sum(p.numel() for p in model.parameters())
-
-        idx_pool = batch_order(len(X), args.batch_size, 0, args.seed)
-        x, y = X[idx_pool[0]], Y[idx_pool[0]]
-
-        def profiled_step():
-            with record_function("forward"):
-                losses = loss_fn(model(x), y)
-            sync(device)
-            with record_function("gramian_pass"):
-                g = engine.compute_gramian(losses)
-            sync(device)
-            with record_function("weighting_qp"):
-                wts = weighting(g)
-            sync(device)
-            with record_function("backward_step"):
-                losses.backward(wts)
-                opt.step(); opt.zero_grad()
-            sync(device)
-
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
-
-        sync(device); t_wall0 = time.perf_counter()        # (c) synced wall-clock bracket
-        with profile(activities=activities, record_shapes=True,
-                     profile_memory=True, with_stack=False) as prof:
-            for _ in range(args.active_steps):
+        for engine_name in args.engines:
+            args.width = w
+ 
+            if engine_name == "autogram":
+                model, opt, engine, weighting = _build_autogram(
+                    args.dataset, args.seed, out, w, device, args.lr)
+            elif engine_name == "algo3-hadamard":
+                model = make_model(args.dataset, w)
+                model.load_state_dict(init_state(args.dataset, args.seed, out, w))
+                model.to(device)
+                opt = torch.optim.SGD(model.parameters(), lr=args.lr)
+                weighting = UPGradWeighting()
+            else:
+                raise ValueError(f"unknown engine {engine_name!r}")
+ 
+            n_params = sum(p.numel() for p in model.parameters())
+            idx_pool = batch_order(len(X), args.batch_size, 0, args.seed)
+            x, y = X[idx_pool[0]], Y[idx_pool[0]]
+ 
+            acc = {k: 0.0 for k in SEGMENTS}
+ 
+            if engine_name == "autogram":
+                def profiled_step():
+                    sync(device); t0 = time.perf_counter()
+                    with record_function("forward"):
+                        losses = loss_fn(model(x), y)
+                    sync(device); t1 = time.perf_counter()
+                    with record_function("gramian_pass"):
+                        g = engine.compute_gramian(losses)
+                    sync(device); t2 = time.perf_counter()
+                    with record_function("weighting_qp"):
+                        wts = weighting(g)
+                    sync(device); t3 = time.perf_counter()
+                    with record_function("backward_step"):
+                        losses.backward(wts)
+                        opt.step(); opt.zero_grad()
+                    sync(device); t4 = time.perf_counter()
+                    for k, dt in zip(SEGMENTS, (t1 - t0, t2 - t1, t3 - t2, t4 - t3)):
+                        acc[k] += dt
+            else:  # algo3-hadamard
+                def profiled_step():
+                    sync(device); t0 = time.perf_counter()
+                    with record_function("fused_forward_gramian"):
+                        g, logits = algorithm3(model, x, y)
+                    sync(device); t2 = time.perf_counter()
+                    with record_function("weighting_qp"):
+                        wts = weighting(g)
+                    sync(device); t3 = time.perf_counter()
+                    with record_function("backward_step"):
+                        losses = loss_fn(logits, y)
+                        losses.backward(wts.to(losses.dtype))
+                        opt.step(); opt.zero_grad()
+                    sync(device); t4 = time.perf_counter()
+                    acc["forward"] += 0.0          # not separable for this engine -- expected
+                    acc["gramian_pass"] += t2 - t0  # fused forward+Gramian cost lives here
+                    acc["weighting_qp"] += t3 - t2
+                    acc["backward_step"] += t4 - t3
+ 
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+ 
+            # --- Stage A: warmup fully OUTSIDE the profiler (CUDA/cuDNN/model). ---
+            for _ in range(args.warmup):
                 profiled_step()
-        sync(device); t_wall1 = time.perf_counter()
-
-        wall_ms = 1000 * (t_wall1 - t_wall0) / args.active_steps
-        peak_mib = (torch.cuda.max_memory_allocated(device) / 2**20
-                   if device.type == "cuda" else float("nan"))
-
-        time_sort = "self_cuda_time_total" if device.type == "cuda" else "self_cpu_time_total"
-        mem_sort = "self_cuda_memory_usage" if device.type == "cuda" else "self_cpu_memory_usage"
-
-        # ---- Table A: operator time (self-time sorted, CPU+GPU) ----
-        table_time = prof.key_averages().table(sort_by=time_sort, row_limit=20)
-        # ---- Table B: operator memory (which ops allocate the most) ----
-        table_mem = prof.key_averages().table(sort_by=mem_sort, row_limit=15)
-        # ---- Table C: grouped by input tensor shape -- ties directly to the
-        # source-confirmed finding that JacobianComputer materializes one
-        # [m, P_layer] tensor per module; this shows WHICH shape dominates ----
-        table_shape = prof.key_averages(group_by_input_shape=True).table(
-            sort_by=time_sort, row_limit=15)
-        # ---- Table D: segment breakdown, from our record_function labels ----
-        seg_rows = {e.key: e for e in prof.key_averages() if e.key in seg_names}
-        seg_summary = {
-            k: {"cpu_us": e.self_cpu_time_total / args.active_steps,
-               "cuda_us": (getattr(e, "self_device_time_total", getattr(e, "self_cuda_time_total", 0)) / args.active_steps
-                          if device.type == "cuda" else float("nan"))}
-            for k, e in seg_rows.items()
-        }
-
-        (out / f"profile_w{w}_time.txt").write_text(table_time)
-        (out / f"profile_w{w}_memory.txt").write_text(table_mem)
-        (out / f"profile_w{w}_shapes.txt").write_text(table_shape)
-        trace_path = out / f"profile_w{w}_trace.json"
-        prof.export_chrome_trace(str(trace_path))
-
-        print(f"\n{'='*70}\nwidth={w} ({n_params/1e6:.2f}M params) m={args.batch_size} "
-              f"device={device}\n{'='*70}")
-        print(f"wall time/step: {wall_ms:.2f} ms   peak memory: {peak_mib:.1f} MiB")
-        print("segment breakdown (per step):")
-        for seg in SEGMENTS:
-            r = seg_summary.get(seg, {"cpu_us": float("nan"), "cuda_us": float("nan")})
-            print(f"  {seg:15s} cpu={r['cpu_us']:9.1f}us  cuda={r['cuda_us']:9.1f}us")
-            
-        real_ops = sorted((e for e in prof.key_averages() if e.key not in seg_names),
-                          key=lambda e: getattr(e, time_sort.replace("cuda", "device"), getattr(e, time_sort, 0)), reverse=True)
-        print("top ops by self time: " + ", ".join(
-            f"{e.key}({getattr(e, time_sort.replace('cuda', 'device'), getattr(e, time_sort, 0)):.0f}us)" for e in real_ops[:3]))
-        
-        print(f"full tables: {out}/profile_w{w}_{{time,memory,shapes}}.txt")
-        print(f"trace: {trace_path}  (open in https://ui.perfetto.dev)")
-
-        summary_rows.append({"width": w, "params": n_params, "wall_ms": wall_ms,
-                             "peak_mib": peak_mib, "segments": seg_summary})
-
+            for k in acc:
+                acc[k] = 0.0
+ 
+            # --- Stage B: warmup INSIDE the profiler context, discarded. This is
+            # the actual fix -- absorbs the profiler's own first-use cost so it
+            # doesn't land in step 0 of the numbers you keep. ---
+            sync(device); t_wall0 = time.perf_counter()
+            with profile(activities=activities, record_shapes=True,
+                         profile_memory=True, with_stack=False) as prof:
+                for _ in range(args.profiler_warmup):
+                    profiled_step()
+                for k in acc:
+                    acc[k] = 0.0
+                t_wall0 = time.perf_counter()  # restart the wall clock post-warmup too
+                for _ in range(args.active_steps):
+                    profiled_step()
+            sync(device); t_wall1 = time.perf_counter()
+ 
+            wall_ms = 1000 * (t_wall1 - t_wall0) / args.active_steps
+            peak_mib = (torch.cuda.max_memory_allocated(device) / 2**20
+                       if device.type == "cuda" else float("nan"))
+ 
+            time_sort = "self_cuda_time_total" if device.type == "cuda" else "self_cpu_time_total"
+            mem_sort = "self_cuda_memory_usage" if device.type == "cuda" else "self_cpu_memory_usage"
+ 
+            table_time = prof.key_averages().table(sort_by=time_sort, row_limit=20)
+            table_mem = prof.key_averages().table(sort_by=mem_sort, row_limit=15)
+            table_shape = prof.key_averages(group_by_input_shape=True).table(
+                sort_by=time_sort, row_limit=15)
+            seg_summary = {k: (v / args.active_steps) * 1_000_000 for k, v in acc.items()}
+ 
+            tag = f"{engine_name}_w{w}"
+            (out / f"profile_{tag}_time.txt").write_text(table_time)
+            (out / f"profile_{tag}_memory.txt").write_text(table_mem)
+            (out / f"profile_{tag}_shapes.txt").write_text(table_shape)
+            trace_path = out / f"profile_{tag}_trace.json"
+            prof.export_chrome_trace(str(trace_path))
+ 
+            print(f"\n{'='*70}\n{engine_name} width={w} ({n_params/1e6:.2f}M params) "
+                  f"m={args.batch_size} device={device}\n{'='*70}")
+            print(f"wall time/step: {wall_ms:.2f} ms   peak memory: {peak_mib:.1f} MiB")
+            print("segment breakdown (per step, synced wall clock, post profiler-warmup):")
+            for seg in SEGMENTS:
+                note = "  (n/a -- fused into gramian_pass for this engine)" if (
+                    engine_name == "algo3-hadamard" and seg == "forward") else ""
+                print(f"  {seg:22s} {seg_summary.get(seg, 0):9.1f} us{note}")
+ 
+            real_ops = sorted((e for e in prof.key_averages() if e.key not in seg_names),
+                              key=lambda e: getattr(e, time_sort.replace("cuda", "device"),
+                                                    getattr(e, time_sort, 0)), reverse=True)
+            print("top ops by self time: " + ", ".join(
+                f"{e.key}({getattr(e, time_sort.replace('cuda', 'device'), getattr(e, time_sort, 0)):.0f}us)"
+                for e in real_ops[:3]))
+            print(f"full tables: {out}/profile_{tag}_{{time,memory,shapes}}.txt")
+            print(f"trace: {trace_path}  (open in https://ui.perfetto.dev)")
+ 
+            summary_rows.append({"engine": engine_name, "width": w, "params": n_params,
+                                 "wall_ms": wall_ms, "peak_mib": peak_mib,
+                                 "segments": seg_summary})
+ 
     args.width = 1
     (out / f"profile_{args.dataset}_summary.json").write_text(json.dumps(summary_rows, indent=2))
-
-    # ---- Table E: width-sweep summary ----
-    print(f"\n{'='*70}\nTable E -- profile sweep summary across widths\n{'='*70}")
-    print(f"{'width':>6} | {'params(M)':>10} | {'wall ms/step':>13} | {'peak MiB':>9} | "
-          f"{'gramian %':>10} | {'qp %':>7}")
+ 
+    print(f"\n{'='*70}\nTable E -- profile sweep summary\n{'='*70}")
+    print(f"{'engine':>16} | {'width':>5} | {'params(M)':>10} | {'wall ms/step':>13} | "
+          f"{'peak MiB':>9} | {'gramian %':>10} | {'qp %':>7}")
     for r in summary_rows:
         seg = r["segments"]
-        total = sum(v["cpu_us"] for v in seg.values() if math.isfinite(v["cpu_us"]))
-        gram_pct = 100 * seg.get("gramian_pass", {}).get("cpu_us", 0) / total if total else float("nan")
-        qp_pct = 100 * seg.get("weighting_qp", {}).get("cpu_us", 0) / total if total else float("nan")
-        print(f"{r['width']:>6} | {r['params']/1e6:>10.2f} | {r['wall_ms']:>13.2f} | "
-              f"{r['peak_mib']:>9.1f} | {gram_pct:>9.1f}% | {qp_pct:>6.1f}%")
+        total = sum(seg.values())
+        gram_pct = 100 * seg.get("gramian_pass", 0) / total if total else float("nan")
+        qp_pct = 100 * seg.get("weighting_qp", 0) / total if total else float("nan")
+        print(f"{r['engine']:>16} | {r['width']:>5} | {r['params']/1e6:>10.2f} | "
+              f"{r['wall_ms']:>13.2f} | {r['peak_mib']:>9.1f} | {gram_pct:>9.1f}% | {qp_pct:>6.1f}%")
     print(f"\nSaved {out / f'profile_{args.dataset}_summary.json'}")
 
 
