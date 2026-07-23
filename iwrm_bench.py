@@ -378,13 +378,20 @@ def cmd_preflight(args, device, out, X, Y):
     print(f"[gate 3] {args.k_steps}-step trajectory max param diff = {max_diff:.2e} "
           f"(tolerance {tol:.0e})")
     assert max_diff < tol, "autojac and autogram trajectories diverged"
-    # --- Gate 4: algorithm3 Gramian exact match
-    # Compute the Gramian using your custom algorithm
-    g_h, logits_h = algorithm3(model, X[:args.batch_size], Y[:args.batch_size])
-    
-    # G was computed by autogram earlier in Gate 2
-    assert (g_h - G).abs().max() < 1e-4 * G.abs().max(), "algorithm3 Gramian does not match autogram!"
-    print("[gate 4] algorithm3 Gramian exact match. OK")
+    model64 = make_model(args.dataset).to(device).double()
+    model64.load_state_dict({k: v.double() for k, v in model.state_dict().items()})
+    engine64 = Engine(model64, batch_dim=0)
+    X64 = X[:args.batch_size].double()
+    Y64 = Y[:args.batch_size]
+    losses64 = loss_fn(model64(X64), Y64)
+    G64 = engine64.compute_gramian(losses64)
+
+    g_h, _ = algorithm3(model64, X64, Y64)
+    max_diff = (g_h - G64).abs().max().item()
+    tol4 = 1e-6
+    print(f"[gate 4] algorithm3 vs autogram (float64, matching precision): "
+          f"max diff = {max_diff:.2e} (tolerance {tol4:.0e})")
+    assert max_diff < tol4, "algorithm3 Gramian does not match autogram!"
     print("preflight passed (4/4 gates)")
 
 
