@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jdgram"
+version = "0.1.0"
+description = "Exact Gramian engines for Jacobian Descent"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.4"]
+
+[project.optional-dependencies]
+# The reference engine the gates compare against.
+torchjd = ["torchjd>=0.17"]
+# Legacy CIFAR harness only.
+cifar = ["torchvision", "matplotlib"]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["gates"]
+# Gate scripts import the package under test and the sandbox model.
+pythonpath = ["src", "."]

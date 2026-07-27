@@ -1,0 +1,41 @@
+$ C:\Users\garba\miniconda3\envs\torch-cuda\python.exe -u C:\pyprojects\jd_playground\jd-phase25-bench\iwrm_bench.py profile --dataset cifar10 --widths 1 2 --warmup 3 --active-steps 5 --out C:\pyprojects\jd_playground\jd-phase25-bench\results
+
+C:\Users\garba\miniconda3\envs\torch-cuda\Lib\site-packages\torch\profiler\profiler.py:217: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+
+======================================================================
+width=1 (0.13M params) m=32 device=cuda
+======================================================================
+wall time/step: 27.86 ms   peak memory: 261.1 MiB
+segment breakdown (per step):
+  forward         cpu=      0.0us  cuda=   1384.9us
+  gramian_pass    cpu=      0.0us  cuda=      0.8us
+  weighting_qp    cpu=      0.0us  cuda=   1770.4us
+  backward_step   cpu=   1229.7us  cuda=      0.0us
+top ops by self time: aten::convolution_backward(1866us), aten::mm(930us), _ZN2at6native51_GLOBAL__N__67b3c33b_18_DepthwiseConv2d_cu_2ee6150b35conv_depthwise2d_grad_weight_kernelIfjEEvN5torch10headeronly6detail27GenericPackedTensorAccessorINS5_14TensorAccessorIN3c108ArrayRefIxEEKT_Ly3ENS4_16DefaultPtrTraitsEiEENS_6detail16IndexBoundsCheckILy4EiEESC_Ly4ESD_iEESI_NS6_INS7_ISA_SB_Ly3ESD_iEESH_SB_Ly4ESD_iEEiiiiiiiiiiiiiiii(745us)
+full tables: C:\pyprojects\jd_playground\jd-phase25-bench\results/profile_w1_{time,memory,shapes}.txt
+trace: C:\pyprojects\jd_playground\jd-phase25-bench\results\profile_w1_trace.json  (open in https://ui.perfetto.dev)
+
+======================================================================
+width=2 (0.53M params) m=32 device=cuda
+======================================================================
+wall time/step: 25.20 ms   peak memory: 897.2 MiB
+segment breakdown (per step):
+  forward         cpu=      0.0us  cuda=   1333.1us
+  gramian_pass    cpu=      0.0us  cuda=      0.8us
+  weighting_qp    cpu=      0.0us  cuda=   1680.9us
+  backward_step   cpu=   1439.9us  cuda=      0.0us
+top ops by self time: aten::convolution_backward(3538us), aten::mm(2771us), _ZN7cutlass7Kernel2I42cutlass_80_simt_sgemm_32x128_8x5_tn_align1EEvNT_6ParamsE(2395us)
+full tables: C:\pyprojects\jd_playground\jd-phase25-bench\results/profile_w2_{time,memory,shapes}.txt
+trace: C:\pyprojects\jd_playground\jd-phase25-bench\results\profile_w2_trace.json  (open in https://ui.perfetto.dev)
+
+======================================================================
+Table E -- profile sweep summary across widths
+======================================================================
+ width |  params(M) |  wall ms/step |  peak MiB |  gramian % |    qp %
+     1 |       0.13 |         27.86 |     261.1 |       0.0% |    0.0%
+     2 |       0.53 |         25.20 |     897.2 |       0.0% |    0.0%
+
+Saved C:\pyprojects\jd_playground\jd-phase25-bench\results\profile_cifar10_summary.json
+
+--- exit 0 in 8.3s ---

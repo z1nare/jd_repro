@@ -1,0 +1,19 @@
+$ C:\Users\garba\miniconda3\envs\torch-cuda\python.exe -u C:\pyprojects\jd_playground\jd-phase25-bench\iwrm_bench.py table7 --dataset cifar10 --warmup 3 --timed 10 --out C:\pyprojects\jd_playground\jd-phase25-bench\results
+
+[SGD-ERM ]   0.036 +/- 0.002 s/epoch
+[Mean    ]   0.363 +/- 0.006 s/epoch
+[UPGrad  ]   0.484 +/- 0.011 s/epoch
+[PCGrad  ]   0.687 +/- 0.007 s/epoch
+[MGDA    ]   1.440 +/- 0.431 s/epoch
+
+| Method | yours s/epoch | yours ratio (Mean=1) | paper ratio (Mean=1) |
+|---|---|---|---|
+| SGD-ERM | 0.036 +/- 0.002 | 0.10 | 0.28 |
+| Mean | 0.363 +/- 0.006 | 1.00 | 1.00 |
+| UPGrad | 0.484 +/- 0.011 | 1.33 | 1.14 |
+| PCGrad | 0.687 +/- 0.007 | 1.89 | 1.78 |
+| MGDA | 1.440 +/- 0.431 | 3.96 | 2.97 |
+
+Saved C:\pyprojects\jd_playground\jd-phase25-bench\results\table7_cifar10.md
+
+--- exit 0 in 46.2s ---

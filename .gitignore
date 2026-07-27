@@ -1,5 +1,27 @@
 data/
 __pycache__/
-*.pt
-results_bundle.zip
+*.py[cod]
 .vscode/
+.venv/
+.venv*/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Regenerable init checkpoints. These reached hundreds of GB across a width
+# sweep and once produced a 125 GB archive temp file before being killed.
+*.pt
+*.ckpt
+
+# Profiler traces: large, machine-specific, inspected in place or on Perfetto.
+*_trace.json
+*.pt.trace.json
+
+# Archives and bundles. Results are synced with rsync, not zipped.
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+results_bundle.*
+pull.*

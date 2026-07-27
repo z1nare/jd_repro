@@ -1,49 +1,65 @@
-# TorchJD IWRM benchmarks — CIFAR-10
+# jdgram — exact Gramian engines for Jacobian Descent
 
-Independent reproduction and profiling harness for
-[TorchJD](https://github.com/TorchJD/torchjd) on the IWRM setting of
-[*Jacobian Descent for Multi-Objective Optimization*](https://arxiv.org/abs/2406.16232)
-(arXiv:2406.16232v3), plus a custom Gramian engine (`algo3-hadamard`).
+Computing `G = J Jᵀ` for multi-objective optimisation without materialising the
+`[m, P]` Jacobian, so Jacobian Descent runs at LLM scale.
 
-Full write-up: **[RESULTS.md](RESULTS.md)**. Raw fuji2 artifacts:
-[`results_extensive_fuji2/`](results_extensive_fuji2/),
-[`results_w106_112/`](results_w106_112/).
+The deliverable is **one exact engine that picks the cheapest correct identity
+per layer**: a closed form where materialising `J_ℓ` would be the memory wall
+(the vocab head, tied embeddings, or large `m`), and plain `J_ℓ J_ℓᵀ`
+materialisation where it would not (interior linears at small `m`). Both routes
+produce the same `G`, so the choice is engineering, and the crossover comes from
+measurement rather than taste.
 
-## Key findings (fuji2, RTX A5000 24 GB)
+Design doc: **[`docs/design/gramian_engines.md`](docs/design/gramian_engines.md)**.
 
-- **Convergence:** UPGrad beats Mean (AUC 381 vs 495). PCGrad diverges at
-  lr ≥ 0.01. MGDA learns poorly — same qualitative story as the paper.
-- **Engines at paper scale:** `algo3-hadamard` is the **fastest** path
-  (0.20 s/epoch) vs `autogram` (0.33) and `autojac` (0.45), with modest
-  memory vs autogram (134 vs 82 MiB).
-- **Capacity:** TorchJD `autojac` / `autogram` OOM at **134M params** (w=32).
-  Hadamard runs to **1.65B params** (w=112, 22.6 GB peak) — about **12×**
-  TorchJD’s ceiling on the same card — then OOM at w=128.
-- **Bottleneck:** at small objective counts (m=4–16), Gramian accumulation
-  dominates; QP share is secondary. At m=64 the sequential QP dominates.
+## Status
 
-## Running
+**Proven.** The CIFAR/IWRM path. The Hadamard-factorised engine matches
+TorchJD's `autogram` to 2.8e-14 at float64, is the fastest of the three engines
+at paper scale, and reaches 1.65B parameters on a 24 GB A5000 against TorchJD's
+134M ceiling — about 12×. Full report:
+[`docs/results_cifar.md`](docs/results_cifar.md).
+
+That result was earned at `m=32` with rank-1 per-layer gradients. The transformer
+target has `m=2–8` and rank-up-to-`BT` gradients, which changes which engine wins
+per layer — hence the hybrid framing rather than "Hadamard everywhere".
+
+**In progress.** Transformer identities, one gated layer at a time, in a nanoGPT
+sandbox. Nothing ships until its gate passes against brute-force autograd. Gate
+status per operator: [`docs/operator_table.md`](docs/operator_table.md).
+
+## Layout
+
+| Path | What |
+|---|---|
+| `src/jdgram/identities/` | one module per layer family |
+| `src/jdgram/engine/` | hook plumbing, registry, route selection |
+| `gates/` | equivalence tests vs brute-force autograd — the preflight |
+| `bench/` | timing, capacity, cost-model crossover measurement |
+| `models/nanogpt/` | pinned upstream `model.py`, the gate sandbox |
+| `legacy/cifar/` | frozen harness that produced the CIFAR report |
+| `docs/` | design doc, identity index, operator table, results |
+| `results/` | `cifar_fuji2/` (frozen) and `transformer/` (new) |
+
+## Getting started
 
 ```bash
-pip install -r requirements.txt
-
-python run_all.py --quick     # short sanity pass
-python run_all.py             # full suite (laptop-safe widths)
-python iwrm_bench.py --help
+pip install -e ".[torchjd,dev]"
+pytest gates/ -v
 ```
 
-On a 24 GB GPU, push hadamard alone:
+Only the legacy CIFAR gate is implemented today; the transformer gates skip
+themselves until their step lands.
 
-```bash
-python iwrm_bench.py scaling --dataset cifar10 \
-  --widths 96 106 112 --engines algo3-hadamard --warmup 2 --timed 3
-```
+## Working rules
 
-Every trusted suite starts with `preflight` (autojac / autogram / hadamard
-equivalence).
+These are what made the CIFAR numbers credible, and they carry over:
 
-## Environments
-
-- **Reported here:** fuji2, 4× A5000 24 GB, torch 2.4.1+cu121, Python 3.10
-- Cluster torch pins may differ from `requirements.txt` (`torch>=2.7` for
-  laptop); pin CUDA wheels to match the host driver when needed.
+- Every gate is a committed script, and no step starts before the previous gate
+  passes.
+- `dropout = 0.0` in gates, or the brute-force and hooked passes see different
+  networks and the comparison proves nothing.
+- fp64 for gates; fp32 for real-shape runs.
+- No `torch.compile` until all gates pass eager — it is a performance knob, not
+  a correctness tool.
+- On a gate failure, shrink the hooked-module set before touching the maths.

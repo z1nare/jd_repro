@@ -1,0 +1,11 @@
+PLACEHOLDER -- fill this in when model.py is copied.
+
+Source:  https://github.com/karpathy/nanoGPT
+File:    model.py  (copied verbatim, no edits beyond what disabling/enabling
+                    weight tying requires for gates 5a-5e)
+Commit:  <pinned hash>
+Date:    <date pulled>
+
+Why pinned: the gates compare a hooked engine against brute-force autograd on
+*this exact* module tree.  If model.py drifts, a passing gate stops meaning
+what it meant.  Record the hash, never track upstream silently.

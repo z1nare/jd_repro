@@ -1,0 +1,8 @@
+$ C:\Users\garba\miniconda3\envs\torch-cuda\python.exe -u C:\pyprojects\jd_playground\jd-phase25-bench\iwrm_bench.py preflight --dataset cifar10 --out C:\pyprojects\jd_playground\jd-phase25-bench\results
+
+[gate 1] pref_vector defaults identical (None -> uniform 1/m). OK
+[gate 2] autogram accepts the paper CNN; Gramian (32, 32). OK
+[gate 3] 3-step trajectory max param diff = 5.96e-08 (tolerance 5e-04)
+preflight passed (3/3 gates)
+
+--- exit 0 in 6.3s ---
