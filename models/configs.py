@@ -20,7 +20,65 @@ rate-limited, so real-shape runs are fp32).
 """
 
 from __future__ import annotations
+import torch 
+import torch.nn as nn
+from models.nanogpt.model import GPT, GPTConfig
+
+@dataclass
+class GateTinyConfig:
+    n_layer: int = 2
+    n_head: int = 2
+    n_embd: int = 64
+    block_size: int = 16
+    vocab_size: int = 65
+    dropout: float = 0.0
+    bias: bool = True
+    tie_weights: bool = False   # False for 5a-5d
+    m: int = 4                  # objectives = batch size
+
+    def cfg2gpt(self) -> GPTConfig:
+        assert self.dropout == .0
+        return GPTConfig(
+            n_layer=self.n_layer,
+            n_head = self.n_head,
+            n_embd= self.n_embd,
+            block_size=self.block_size,
+            vocab_size= self.vocab_size,
+            dropout= self.dropout,
+            bias= self.bias
+        )
+
+class gateGPT(GPT):
+   def _init__(self, config: GPTConfig, tie_weights: bool = False):
+      super().__init__(config)
+      if not tie_weights:
+         self.transformer.wte.weight = nn.Parameter(
+            self.transformer.wte.weight.detach().clone()
+         )
 
 
-def gate_tiny(*args, **kwargs):
-    raise NotImplementedError("gate config: step 0 of the execution plan")
+def build_gate_model(bias: bool, tie_weights: bool = False, device="cuda", dtype=torch.float64) -> GPT:
+  cfg = GateTinyConfig(bias = bias, tie_weights=tie_weights)
+  model = gateGPT(cfg.cfg2gpt() , tie_weights)
+  model.to(device=device, dtype=dtype)
+  model.eval()
+  return model
+
+    
+def gate_batch(config: GateTinyConfig, seed : int, device = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
+    g = torch.Generator(device = device).manual_seed(seed)
+    idx = torch.randint(0, config.vocab_size, (config.m, config.block_size), generator=g, device=device)
+    targets = torch.randint(0, config.vocab_size, (config.m, config.block_size), generator=g, device=device)
+    return idx, targets
+def forward_logits(model, idx) -> torch.Tensor:               # [B,T,V], no scalar loss shortcut
+  logits, _ = model(idx, targets=None)
+  return logits
+  
+def per_sequence_losses(logits, targets) -> torch.Tensor:     # [m]
+  B, T, V = logits.shape
+
+  per_token_loss=  torch.nn.functional.cross_entropy(logits.reshape(-1, V), targets.reshape(-1), reduction="none")
+
+  per_token_loss = per_token_loss.reshape(B,T)
+  per_sequence_loss = per_token_loss.mean(dim=1)
+  return per_sequence_loss
