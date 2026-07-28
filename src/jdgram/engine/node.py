@@ -1,24 +1,49 @@
-"""PLACEHOLDER -- autograd-graph node that fires a layer's Gramian identity.
+"""Autograd node that captures a layer's upstream gradient during backward.
 
-Skeleton borrowed from TorchJD's ``AutogramNode``.  Two responsibilities:
+Ported from TorchJD 0.17.0 ``torchjd/autogram/_module_hook_manager.py``
+(``AutogramNode``), MIT licence, (c) Valerian Rey, Pierre Quinton.
 
-1. Sit in the backward graph so the identity runs with ``A`` in hand and can
-   release it immediately afterwards.
-2. Hold the ``remaining_counter`` cache used for **weight sharing**: a tied
-   parameter is reached by the backward pass more than once, and its Gramian
-   contribution is only complete after the *last* site has been visited.
-   Counting down the expected visits, accumulating ``(A, X)`` per site, and
-   flushing on zero is what makes the II.4 cross terms computable at all.
+Identity on forward, side effect on backward.  The node exists so that a
+layer's upstream gradient ``A`` is observable at the exact point in the reverse
+pass where it is live, without holding the whole Jacobian anywhere.
 
-First needed at gate 5a (single site); the counter logic first matters at
-gate 5e (tied ``wte``/``lm_head``).
+Divergence from upstream: TorchJD fires the Gramian computation *inside*
+``backward`` and accumulates immediately.  Here ``backward`` only hands the
+gradients to a capture object; the identities fire once per module after the
+driver's m-objective loop.  That is a deliberate gate-scale simplification --
+see :mod:`jdgram.engine.hooks` for the orchestration and why.
 """
 
 from __future__ import annotations
 
+from typing import Any, Protocol
 
-class GramianNode:
-    """PLACEHOLDER."""
+import torch
+from torch import Tensor
 
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError("AutogramNode skeleton: step 1 of the execution plan")
+
+class GradientSink(Protocol):
+    """Receives one backward visit's gradients for a single module."""
+
+    def record_backward(self, grad_outputs: tuple[Tensor, ...]) -> None: ...
+
+
+class GramianNode(torch.autograd.Function):
+    generate_vmap_rule = True
+
+    @staticmethod
+    def forward(_sink: GradientSink, *rg_tensors: Tensor) -> tuple[Tensor, ...]:
+        # detach, not `return rg_tensors`: handing back the inputs verbatim makes
+        # autograd treat this as a no-op and the node never enters the graph.
+        return tuple(t.detach() for t in rg_tensors)
+
+    @staticmethod
+    def setup_context(ctx: Any, inputs: tuple, _output: Any) -> None:
+        ctx.sink = inputs[0]
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Tensor) -> tuple:
+        ctx.sink.record_backward(tuple(g.detach() for g in grad_outputs))
+        # Pass gradients through untouched: this node must not perturb the
+        # reverse pass it is observing.
+        return None, *grad_outputs
