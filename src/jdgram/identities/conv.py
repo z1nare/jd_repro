@@ -1,11 +1,5 @@
 """Grouped/depthwise Conv2d Gramian identity.
 
-Moved verbatim (behaviour-preserving) from the top-level ``hadamard.py`` that
-produced the CIFAR results in ``docs/results_cifar.md``.  Retained because
-``gates/test_legacy_cifar.py`` re-runs the old preflight gate 4 against it: it
-is the only currently *proven* identity in the package, and it stays the
-regression anchor while the transformer identities are built.
-
 Derivation of the vectorized form (why this is the same math):
   a per-group loop computed, for each g:
       J_g = A_g_reshaped @ unfolded_g^T          [m, Cout_g, Cin_g*kH*kW]
@@ -20,10 +14,6 @@ Memory is identical to the loop version -- the ``[m, P_layer]`` block ``J`` is
 materialized either way (grouped-conv ``P_layer`` is small: ``Cout * Cin_g * kH*kW``).
 The win is kernel-launch count and Python overhead, i.e. exactly the
 dispatch-bound regime the Perfetto traces showed.
-
-Note on routing: this is a *materialization* route, not a closed form.  Under
-the design doc's I.3 cost model that is the correct choice here precisely
-because grouped-conv ``P_layer`` is small.
 """
 
 from __future__ import annotations

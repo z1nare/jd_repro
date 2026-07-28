@@ -1,22 +1,46 @@
-"""PLACEHOLDER -- LayerNorm / RMSNorm (design doc II.5).
-
-No trick needed here.  The per-objective parameter gradients are ``d``-vectors::
-
-    dL_i/d(gamma) = sum_u A_i[u] . xhat[u]        (and analogously for beta)
-
-so materializing ``[m, d]`` and taking ``M M^T`` is already cheap -- ``d`` is
-small.  This is the *materialization route* of the I.3 cost model, chosen on
-purpose rather than by omission.
-
-BatchNorm is deliberately out of scope (cross-instance coupling breaks the
-per-objective decomposition).  Irrelevant for the transformer target, which
-uses LayerNorm/RMSNorm.
-
-Gate: gates/test_5c_norms_bias.py.
-"""
-
 from __future__ import annotations
 
+import torch
+def norm_gramian(
+    A: torch.Tensor,
+    X: torch.Tensor,
+    has_bias: bool = True,
+    eps: float = 1e-5,
+    center: bool = True,
+) -> torch.Tensor:
+    """
+    Gramian for LayerNorm (center=True) or RMSNorm (center=False).
 
-def norm_gramian(*args, **kwargs):
-    raise NotImplementedError("II.5 norm materialization: not yet implemented")
+    Args:
+        A:      [m, T, d] upstream grads at the norm *output* (same device as model).
+        X:      [m, T, d] *raw* hook input (pre-normalization), not xhat.
+        has_bias: LayerNorm beta present; usually False for RMSNorm.
+        eps:    match module.eps (nanoGPT LayerNorm uses 1e-5).
+        center: True => subtract mean (LayerNorm); False => RMSNorm.
+    Returns: G: [m, m] 
+    """
+    # Keep compute on whatever device A/X already sit on (GPU for cluster).
+    # Do not .cpu() / .item() / host transfers here.
+    dtype = torch.float64  # gates; for throughput runs use A.dtype instead
+    A = A.to(dtype=dtype)
+    X = X.to(dtype=dtype)
+
+    # xhat on-device. biased var matches F.layer_norm (unbiased=False).
+    if center:
+        mu = X.mean(dim=-1, keepdim=True)
+        var = X.var(dim=-1, keepdim=True, unbiased=False)
+        xhat = (X - mu) * torch.rsqrt(var + eps)
+    else:
+        # RMSNorm: no mean subtract
+        ms = X.pow(2).mean(dim=-1, keepdim=True)
+        xhat = X * torch.rsqrt(ms + eps)
+
+    # [m, d] then [m, m] — all device-local
+    g_gamma = (A * xhat).sum(dim=1)
+    G = g_gamma @ g_gamma.T
+
+    if has_bias:
+        g_beta = A.sum(dim=1)
+        G = G + g_beta @ g_beta.T
+
+    return G

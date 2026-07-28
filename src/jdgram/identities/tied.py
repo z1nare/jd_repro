@@ -1,33 +1,65 @@
-"""PLACEHOLDER -- tied weights, wte == lm_head (design doc II.4).
+"""One shared W at two sites => per-objective grad is the SUM of site grads.
+Frobenius product of two sums => four terms, not two:
 
-With one shared ``W`` used at two sites, the true per-objective gradient is the
-**sum** of the two site gradients, so the Gramian gets four terms::
+    G = G_hh + G_ee + G_he + G_eh
 
-    G_ij = G^hh_ij + G^ee_ij + G^he_ij + G^eh_ij
-
-``G^hh`` via II.1 (linear.sequence_gramian), ``G^ee`` via II.2
-(embedding.token_embedding_gramian), and the cross terms via an index-gather
-contraction::
-
-    G^he_ij = sum_{u,v} A^head_i[u, tok[v]] . (X^head[u] . B_j[v])
-
-where ``B_j`` is the embedding-site upstream gradient.
-
-This is **not** a plain Hadamard of two Grams -- an earlier sketch that treated
-all four terms with one routine was wrong on exactly this point, and that is
-why the cross terms get their own file.
-
-Mechanics: reuse TorchJD's ``remaining_counter`` cache verbatim -- collect
-``(A, X)`` at the head, wait for the embedding's backward, then compute all
-four terms and flush.
-
-Gate: gates/test_5e_tied.py.  This is the hardest step; on failure, diff
-against the gate-5d engine on the *untied* model, which isolates the cross-term
-logic by construction.  Passing 5e is what "layer ports finished" means.
-"""
+G_hh  via linear.sequence_gramian
+G_ee  via embedding.sequence_gramian
+G_he  via the index-gather cross term below
+G_eh  = G_he.T   (write + G_he.T explicitly; do not replace with 2*G_he)"""
 
 from __future__ import annotations
 
+import torch
 
-def tied_gramian(*args, **kwargs):
-    raise NotImplementedError("II.4 four-permutation cross terms: not yet implemented")
+from jdgram.identities import embedding as embedding_id
+from jdgram.identities import linear as linear_id
+import torch.nn.functional as F
+
+def head_embedding_cross(
+    A_head: torch.Tensor,
+    X_head: torch.Tensor,
+    A_emb: torch.Tensor,
+    tokens: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Cross term G_he only.
+    Args:
+        A_head: [m, T, V]  -- d(loss_i) / d(logits[i])
+        X_head: [m, T, d]  -- lm_head input (final hidden states)
+        A_emb:  [m, T, d]  -- d(loss_i) / d(embedding_output[i])
+        tokens: [m, T]     -- input token ids (long)
+    Returns:
+        G_he: [m, m] float64    """
+
+    V = A_head.shape[-1]
+    
+    # 1. Summarize Head side over sequence length T -> [m, V, d]
+    H = torch.einsum("itv, itd -> ivd", A_head.double(), X_head.double())
+
+    # 2. Scatter Embedding side over sequence length T into vocab bins -> [m, V, d]
+    O = F.one_hot(tokens, num_classes=V).double()
+    E = torch.einsum("jsv, jsd -> jvd", O, A_emb.double())
+
+    # 3. Final cross-term Gramian matrix -> [m, m]
+    G_he = torch.einsum("ivd, jvd -> ij", H, E)
+
+    return G_he
+
+
+def tied_gramian(
+    A_head: torch.Tensor,
+    X_head: torch.Tensor,
+    A_emb: torch.Tensor,
+    tokens: torch.Tensor,
+) -> torch.Tensor:
+    """
+    All four permutation terms for the tied wte / lm_head weight.
+    Returns:
+        G: [m, m] float64  (= G_hh + G_ee + G_he + G_eh)
+    """
+    G_hh = linear_id.sequence_gramian(A_head, X_head, has_bias=False)
+    G_ee = embedding_id.sequence_gramian(A_emb, tokens)
+    G_he = head_embedding_cross(A_head, X_head, A_emb, tokens)
+    G_eh = G_he.T
+    return G_hh+G_ee+G_he+G_eh
