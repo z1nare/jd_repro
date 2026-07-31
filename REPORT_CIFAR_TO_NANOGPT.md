@@ -6,8 +6,13 @@ with `T = 1`. This report carries that work to a transformer, where the central
 assumption of the CIFAR result no longer holds, and re-measures everything
 against TorchJD 0.17.
 
-**Provenance.** Every number below is from run tag `v8_20260731-*` on gala1
-(NVIDIA RTX A5000, 24 GiB; torch 2.13.0+cu130, torchjd 0.17.0, Python 3.10.12),
+**Provenance.** §0–§7 and §9–§11 are from run tag `v8_20260731-*` on gala1; §8 is
+from `v9_20260731-*` on fuji2 and is a **run still in progress**. The two boxes
+carry different torch builds, so ratios hold within a version and absolute
+timings do not transfer across them.
+
+gala1 is an NVIDIA RTX A5000, 24 GiB, torch 2.13.0+cu130, torchjd 0.17.0,
+Python 3.10.12; fuji2 is 4x RTX A5000 24 GiB on torch 2.4.1+cu121. Both run an
 fp32 workspace with a float64 accumulator. Correctness is against brute-force
 `autograd.grad` in float64. 25 tagged run directories, each carrying a manifest
 with the git SHA and environment and a `rows.csv` of measurements, indexed in
@@ -33,6 +38,15 @@ this report says why: it was earned under `T = 1`.
 **And a result that contradicts the design intent** (§7): at vocabulary scale the
 router picks the wrong route, costing **2.8× in time** for a memory saving that
 never materialises. Fixing it is the single highest-value item outstanding.
+
+**Now measured at full GPT-2 124M** (§8, run in progress): `autojac` stops
+fitting on a 24 GiB card **between m=7 and m=8** at T=512, and OOMs at
+m=8/T=1024, while both Gramian engines keep running — the first direct evidence
+that there is a size where materialising `[m, P]` is impossible and this approach
+is not. jdgram is exact there (**4.0e-08** against brute force) and runs at
+**0.72–0.75×** `autogram`'s peak untied. Two honest corrections come with it: the
+tied-memory advantage of §7.1 **reverses** at this scale, and the router is
+*right* at small `m·T²` and wrong only as it grows.
 
 ---
 
@@ -363,12 +377,100 @@ single number in the results, only how long they take to produce.
 
 ---
 
-## 8. Additional exploration (not part of the core claim)
+## 8. GPT-2 124M: the scale test (v9, run in progress)
+
+**Status: partial.** Run tag `v9_20260731-*` on **fuji2** (4× RTX A5000 24 GiB,
+torch 2.4.1+cu121) — a different box from the v8 numbers above, so compare
+within a version, not across. Full GPT-2 124M: 12 layers, 12 heads, 768 wide,
+V=50257, 124,439,808 trainable parameters with tying on. `router`, `headline`,
+`crossover` and part of `ladder` have completed; aggregators, accuracy and trace
+are still running. **Two caveats up front:** the gate suite did not execute on
+this box (`pytest` is not installed in that env) and `jacopt` is absent, so there
+is no QP arm. Correctness below rests on the in-run brute-force anchor instead.
+
+### 8.1 `autojac` stops fitting between m=7 and m=8 — the crossover, measured
+
+This is the claim the whole project rests on, and until now nothing had been run
+at a size where it could be tested. Peak MiB, T=512, untied:
+
+| m | jdgram | `autogram` | `autojac` |
+|---|---|---|---|
+| 4 | **3529** | 4707 | 8775 |
+| 6 | **4975** | 6742 | 16378 |
+| 7 | **5698** | 7759 | 21063 |
+| 8 | **6421** | 8777 | **OOM** |
+| 9 | **7144** | 9794 | **OOM** |
+| 12 | **9313** | 12847 | **OOM** |
+
+At the headline rung (m=8, T=1024): jdgram 12206 MiB, `autogram` 14562,
+`autojac` **OOM** — it asked for 12.27 GiB more than the card had.
+
+So there is a real, reachable size at which materialising `[m, P]` is impossible
+and both Gramian engines keep running, and jdgram sits at **0.72–0.75×**
+`autogram`'s peak throughout the untied sweep. The boundary landed exactly inside
+the m=7/m=8 bracket the campaign was designed around.
+
+### 8.2 Correctness holds at 124M
+
+The brute-force anchor now runs at this size (it was previously gated off by an
+element-count guard that demanded `m < 0.32` at 124M):
+
+| | vs brute force |
+|---|---|
+| jdgram | **4.04e-08** (m=4), **5.80e-08** (m=6) |
+| `autogram`, tied | 3.88e-06 – 4.21e-06 |
+| `autojac` | 8.48e-05 / 5.57e-05 |
+
+Two things worth noting. jdgram is exact at full scale, not just at gate scale.
+And **`autojac` is the least accurate of the three** — three orders of magnitude
+looser than jdgram — because its vmapped fp32 reverse accumulates differently.
+That is not a defect, but it does remove "autojac is the trustworthy reference"
+as an argument.
+
+### 8.3 The router bug reproduces — and it is not one-directional
+
+`compute_gramian` ms per iteration, `squashed`:
+
+| config | `auto` | forced T-first | forced d-first | verdict |
+|---|---|---|---|---|
+| m=2, T=256 | 43.4 | 43.4 | 86.3 | auto **right** (T-first 2.0× faster) |
+| m=4, T=256 | 96.5 | 96.6 | 123.7 | auto **right** |
+| m=8, T=256 | 245.1 | 245.7 | **199.3** | auto **wrong**, 1.23× |
+| m=4, T=512 | 234.3 | 244.1 | **199.0** | auto **wrong**, 1.18× |
+
+This is more useful than v8's single data point, and it changes the fix. The rule
+is **correct at small `m·T²` and wrong once it grows** — so the answer is a real
+cost model, not "always take d-first". A blanket switch would have made the
+m=2/T=256 case **twice as slow**. The penalty at 124M (1.18–1.23×) is also
+milder than the 2.76× seen on the small-trunk model at V=50257, because the
+trunk's own work now dominates the head's.
+
+### 8.4 The tied-memory inversion does *not* hold at 124M
+
+§7.1 reported jdgram becoming leaner than `autogram` on tied models at large
+vocabulary. At full GPT-2 that reverses:
+
+| | untied | tied |
+|---|---|---|
+| m=4, T=512 | 0.75× | 1.54× |
+| m=8, T=512 | 0.73× | 1.03× |
+| m=8, T=1024 | 0.84× | 1.19× |
+
+Held captures reach **398.6 MiB** at m=8. At 124M the tied group is a 38.6M-parameter
+object, and holding both sites until the cross terms can be formed costs more
+than `autogram` saves by omitting them. The honest statement is therefore:
+**jdgram is leaner untied, heavier tied, and exact in both** — the memory win and
+the correctness win do not stack at this scale, and §7.1 should be read as a
+property of that smaller model rather than a general result.
+
+---
+
+## 9. Additional exploration (not part of the core claim)
 
 Separated deliberately: directions, some closed by measurement, not established
 results.
 
-### 8.1 LoRA inverts the routing decision and removes the memory ceiling
+### 9.1 LoRA inverts the routing decision and removes the memory ceiling
 
 Test-time training [1, 16] and RL fine-tuning adapt LoRA adapters [8], not full
 weights. For `W_eff = W + BA` the same identity applies with `d_out → r`, and
@@ -388,7 +490,7 @@ Jacobian Descent.** L0 measures the LoRA-shaped kernels directly (r=32): d-first
 **Not yet done:** registering a LoRA module and gating it end to end. The identity
 needs no change; this is registration, not derivation.
 
-### 8.2 GPU QP solvers, and a benchmarking trap worth knowing
+### 9.2 GPU QP solvers, and a benchmarking trap worth knowing
 
 TorchJD ships exactly one dual-cone projector,
 `QuadprogProjector`, and it
@@ -402,7 +504,7 @@ exact and, at these sizes, extremely fast on a CPU.
 Benchmarked against `jacopt`, which solves the same problem with a consensus
 ADMM [3] in the manner of operator-splitting QP solvers such as OSQP [15], and
 is backend-agnostic so the solve follows the array type onto the device. Four
-bugs were fixed in it first (§9.4). The single-thread control settles what
+bugs were fixed in it first. The single-thread control settles what
 looked like a solver failure:
 
 | m | quadprog | jacopt GPU | jacopt CPU (56 threads) | jacopt CPU (1 thread) |
@@ -427,7 +529,7 @@ to end: UPGrad + jacopt is 38.39 ms/step against 29.38 default, identical val CE
 jacopt's accuracy also degrades where it starts winning (rel 1.5e-03 at m=64,
 9.1e-03 at m=128) because ADMM is approximate where quadprog is exact.
 
-### 8.3 Approximation directions closed by measurement
+### 9.3 Approximation directions closed by measurement
 
 - **Top-k truncation of the LM-head gradient.** `A = softmax(z) − onehot(y)` has
   concentrated mass, so keeping the top-k over vocabulary looked promising. It
@@ -445,7 +547,7 @@ Both recorded as checked-and-rejected.
 
 ---
 
-## 9. Honest summary
+## 10. Honest summary
 
 | Question | Answer |
 |---|---|
@@ -455,7 +557,7 @@ Both recorded as checked-and-rejected.
 | Is the QP a bottleneck? | No — 2.7% of a step at m=8. Matters above m ≈ 64. |
 | Is the router working? | **For memory at small V, yes** (34–56% spread). **At vocabulary scale, no** — it costs 2.76× in time for a saving that is invisible at model scale. |
 
-## 10. Open items, ranked
+## 11. Open items, ranked
 
 1. **Fix the router cost model.** Select on `min(time, memory)`, not memory alone.
    Worth **2.76×** at V=50257 and turns a 2.67× time loss into parity. Cheapest
@@ -536,5 +638,5 @@ appends one row to `runs_index.csv`. `bench/profile_stats.py` aggregates.
 parameters. fp32 workspace, float64 accumulator. `m = 8` unless stated.
 Shakespeare-char is a convergence demo, not a language-modelling claim. The box is
 shared (56 CPU threads, other users) — CPU-side timings carry contention noise, as
-§8.2 demonstrates. Two L8 snapshot captures landed after the step completed and
+§9.2 demonstrates. Two L8 snapshot captures landed after the step completed and
 show only the profiler's own allocations; that level needs its capture point moved.
