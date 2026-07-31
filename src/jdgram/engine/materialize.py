@@ -1,20 +1,47 @@
-"""PLACEHOLDER -- the materialization route: form J_l, add J_l J_l^T, discard.
+"""d-first / materialization route: form each objective's weight gradient, Gram it, discard.
 
-The autogram-style fallback, and *not* a second-class citizen: per the I.3 cost
-model this is the **correct** route for interior linears at small m.  At
-m <= 8 a transient [m, P_l] block for a Qwen-1.5B MLP linear is 0.2-0.4 GiB,
-which is not a memory wall, and it costs no extra FLOPs beyond the m-seed
-backward -- whereas the II.1 contraction there would spend roughly 7x (m=4) to
-12x (m=8) the weight-gradient backward cost to save memory that did not need
-saving.
+Not a second-class citizen: for interior linears at modest m this is often
+cheaper than the T-first ``[mT,mT]`` contraction (design doc I.3). Memory is a
+transient ``[m, P_layer]`` block — not autojac's full-model Jacobian.
 
-Both routes produce the identical ``G``, so every gate must pass with routing
-on and with routing forced to either side.  That equivalence is the regression
-net for :mod:`jdgram.engine.router`.
+Both routes produce the identical ``G``; :mod:`jdgram.engine.router` picks.
 """
 
 from __future__ import annotations
 
+import torch
 
-def materialized_gramian(*args, **kwargs):
-    raise NotImplementedError("materialization route: step 6 of the execution plan")
+from jdgram.identities.precision import resolve_workspace_dtype
+
+
+def materialized_gramian(
+    A: torch.Tensor,
+    X: torch.Tensor,
+    has_bias: bool,
+    *,
+    workspace_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """d-first Linear Gramian: ``B[i] = Σ_t A[i,t]⊗X[i,t]``, then ``G = B:B``.
+
+    A: [m, T, d_out], X: [m, T, d_in] → G: [m, m] float64.
+    """
+    if A.ndim != 3 or X.ndim != 3:
+        raise ValueError("A and X must both be rank-3 tensors")
+    if A.shape[:2] != X.shape[:2]:
+        raise ValueError(
+            f"A and X must share [m, T], got {A.shape[:2]} and {X.shape[:2]}"
+        )
+    wd = resolve_workspace_dtype(workspace_dtype)
+    Aw = A.to(wd)
+    Xw = X.to(wd)
+    B = torch.einsum("itp,itq->ipq", Aw, Xw)  # [m, d_out, d_in]
+    # Flatten-then-matmul: contracting all trailing axes against the same axes of
+    # the other operand is exactly a matmul on the flattened view, and reshape on
+    # a contiguous tensor is a view. Measurably leaner than einsum here even
+    # though this particular label order happens not to clone.
+    B_flat = B.reshape(B.shape[0], -1)
+    G = (B_flat @ B_flat.T).double()
+    if has_bias:
+        b = Aw.sum(dim=1)
+        G = G + (b @ b.T).double()
+    return G

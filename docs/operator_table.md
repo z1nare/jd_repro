@@ -1,48 +1,56 @@
 # Operator table
 
-The human-readable view of `src/jdgram/engine/registry.py`. Every operator the
-engine can meet, the identity that covers it, the route the cost model should
-pick, and — the column that matters — whether a gate has actually verified it.
+Which operators support an exact Gramian identity, at what cost, and what backs
+the claim. Parameter-free ops need no identity at all: ordinary autograd
+propagates the upstream gradient `A` through them, which is why supporting a new
+architecture is re-registration rather than new mathematics.
 
-`status: pending` means the algebra is written down and nothing more. Nothing
-ships on the strength of a derivation.
+Gate status is against brute-force `autograd.grad` on a tiny nanoGPT
+(`gates/`), float64, `rtol=0, atol=1e-10`, each test run twice for the `bias`
+and `no-bias` fixtures.
 
-## Parameterized operators
-
-| Operator | Identity | Per-objective rank at a layer | Route | Gate | Status |
+| Operator | Parameterized | Identity | Structure | Route | Gate |
 |---|---|---|---|---|---|
-| `nn.Linear` (rank-1, one position per objective) | Hadamard $(AA^\top)\odot(XX^\top)$ | 1 | closed form | legacy gate 4 | **proven** |
-| `nn.Conv2d` (grouped/depthwise) | batched per-group $JJ^\top$ | — | materialize (small $P_\ell$) | legacy gate 4 | **proven** |
-| `nn.Linear` (sequence, $U=BT$ positions) | II.1 $\langle A_iA_j^\top, XX^\top\rangle_F$ | up to $U$ | cost model | 5a, 5b | pending |
-| Linear bias | II.1 bias term, $[m,d_\text{out}]$ materialization | — | materialize | 5c | pending |
-| `c_attn` (fused QKV) | II.1, `out = 3d` | up to $U$ | cost model | 5b | pending |
-| `attn.c_proj`, `mlp.c_fc`, `mlp.c_proj` | II.1 | up to $U$ | materialize at $m\le8$ | 5b | pending |
-| `lm_head` (vocab head) | II.1; I.4 shortcut under GRPO seeds | up to $U$ | **closed form** | 5a, 6 | pending |
-| `wte` token embedding | II.2 indicator kernel | up to $U$ | closed form | 5d | pending |
-| `wpe` positional embedding | II.3 diagonal shortcut | up to $U$ | closed form | 5d | pending |
-| tied `wte` = `lm_head` | II.4, four permutation terms | up to $U$ | closed form | 5e | pending |
-| `nn.LayerNorm` $\gamma,\beta$ | II.5, $[m,d]$ materialization | — | materialize | 5c | pending |
-| `RMSNorm` $\gamma$ | II.5 | — | materialize | nanochat port | pending |
-| `nn.BatchNorm*` | none — cross-instance coupling breaks the decomposition | — | **out of scope** | — | excluded |
+| `nn.Linear` (QKV, proj, MLP, `lm_head`) | yes | `linear.sequence_gramian` | rank up to `T` under per-sequence losses | both routes; router picks | 5a, 5b — pass |
+| `nn.Linear` bias | yes | bias term `Σ_t A`, then outer product | `[m, d_out]` | d-first | 5b, 5c — pass |
+| `nn.Embedding` (token, `wte`) | yes | `embedding.sequence_gramian` (index-equality kernel) | same contraction shape as Linear | both routes | 5d — pass |
+| `nn.Embedding` (positional, `wpe`) | yes | `positional_embedding_gramian` | diagonal in `t` | d-first | 5d — pass |
+| LayerNorm / RMSNorm | yes | `norm.norm_gramian` | `[m, d]` for `γ`/`β` | d-first (`d` is small) | 5c — pass |
+| **Tied `wte` = `lm_head`** | yes, shared | `tied.tied_gramian`, **four terms** | `G_hh + G_ee + G_he + G_ehᵀ` | closed form + index-gather cross | **5e — pass** |
+| Softmax / SDPA / FlashAttention | no | none | — | autograd only | transitively, 5b–5e |
+| GELU / SiLU | no | none | — | autograd only | transitively, 5b–5e |
+| Residual add, Dropout (`p=0`) | no | none | — | autograd only | transitively |
+| RoPE | no | none | — | autograd only | not exercised (no RoPE model in-repo) |
+| Reverse-driver equivalence | — | — | 3 strategies must agree | — | 5f — pass |
+| Route equivalence | — | — | 2 contraction orders must agree | — | 5g — pass |
+| BatchNorm | yes | **out of scope** | couples batch elements, so per-instance objectives are not independent | — | rejected by the registry |
 
-## Parameter-free operators (II.6 — contribute no Gramian terms)
+## Notes
 
-| Operator | Handling | Gate | Status |
-|---|---|---|---|
-| `nn.ELU` | explicit propagation rule (legacy engine) | legacy gate 4 | **proven** |
-| `nn.MaxPool2d` | explicit propagation rule (legacy engine) | legacy gate 4 | **proven** |
-| `nn.Flatten` / reshapes | explicit propagation rule (legacy engine) | legacy gate 4 | **proven** |
-| Softmax / SDPA / Flash-Attention | autograd propagates $A$; no registration | 5b | pending |
-| GELU / SiLU | autograd propagates $A$; no registration | 5b | pending |
-| Residual adds | autograd propagates $A$; no registration | 5b | pending |
-| RoPE | autograd propagates $A$; no registration | nanochat port | pending |
+1. **Exactness.** Every implemented identity is algebraically exact for
+   `G = J Jᵀ`. Nonlinearities are not approximated — they contribute no Gramian
+   terms whatsoever, and only shape how `A` propagates.
 
-Attention appears here rather than above because it holds no parameters of its
-own — its parameters are the four Linears. This is why the port to nanochat is
-re-registration rather than new math.
+2. **The head is not rank-1 here.** `per_sequence_losses` averages over tokens,
+   so the LM-head gradient has rank up to `T`. This is exactly the assumption
+   that the earlier convolutional work (one objective, one position) got for
+   free and a transformer does not.
 
-## Cost column
+3. **Tied weights are the case that distinguishes this engine.** A parameter
+   reached through two modules has a per-objective gradient that is the *sum*
+   over its sites, so the Frobenius product carries four terms. Summing
+   per-module Gramians computes two of them. The engine computes all four and
+   **refuses to run** on a tied model without an explicit shared handler rather
+   than return a structurally plausible wrong number.
 
-Left empty deliberately. It gets filled from `bench/crossover.py` measurements,
-not from the analytic estimates in the design doc — those are in
-`src/jdgram/costmodel.py` as starting hypotheses to confirm or refute.
+4. **Route selection is a known weak point.** `engine/router.py` decides on
+   workspace alone (`tfirst iff m·T² < P_layer`). Measured at vocabulary scale
+   that picks the slower route for the LM head, for a memory saving that does
+   not materialise at model scale. See `jdgram/costmodel.py` for the mechanism
+   and the numbers. Both routes are numerically identical, so this costs time
+   only.
+
+5. **Not implemented.** `seeds.grpo`; a module called more than once per forward
+   (the engine raises `NotImplementedError`; TorchJD's `remaining_counter` is
+   the model to follow); LoRA registration, though the identity needs no change
+   since `W_eff = W + BA` is the same form with `d_out → r`.

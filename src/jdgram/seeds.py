@@ -35,6 +35,6 @@ def grpo(*args, **kwargs):
     Returning ``(c, s)`` rather than a dense ``A`` is the whole point: dense
     ``A`` at the vocab head is ~4.7 GiB fp32 at V=152k.
 
-    Gate: gates/test_6_grpo_head_seed.py.
+    Not gated yet: the gate has to come with the derivation.
     """
     raise NotImplementedError("GRPO seed: design doc I.4, not yet derived-and-gated")

@@ -4,10 +4,11 @@
 ``[m, P]`` Jacobian.  The engine selects the cheapest *correct* identity per
 layer (see :mod:`jdgram.engine.router`); every route yields the same ``G``.
 
-Status: the CIFAR/IWRM path (:mod:`jdgram.engine.sequential`) is proven against
-TorchJD's ``autogram``.  The transformer identities are being built and gated
-one layer at a time -- see ``docs/design/gramian_engines.md`` and
-``docs/operator_table.md``.  Nothing ships until its gate passes.
+Status: the transformer identities are built and gated -- Linear, bias,
+LayerNorm/RMSNorm, token and positional embeddings, and the tied embedding/head,
+which is the case TorchJD's ``autogram`` gets wrong.  See
+``docs/operator_table.md`` for per-operator status and ``gates/`` for the
+float64 brute-force checks.  Nothing ships until its gate passes.
 """
 
 __all__ = ["seeds", "identities", "engine", "costmodel", "utils"]

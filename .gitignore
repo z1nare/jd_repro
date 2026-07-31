@@ -1,27 +1,41 @@
-data/
+# Python
 __pycache__/
 *.py[cod]
-.vscode/
-.venv/
-.venv*/
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 build/
 dist/
-.pytest_cache/
+.venv/
+venv/
 
-# Regenerable init checkpoints. These reached hundreds of GB across a width
-# sweep and once produced a 125 GB archive temp file before being killed.
+# Editors
+.vscode/
+.idea/
+
+# Datasets: large, downloadable, and regenerable.
+#   CIFAR-10      -> torchvision download
+#   shakespeare   -> python bench/prepare_shakespeare_char.py
+data/
+
+# Checkpoints. Kept out deliberately: an un-ignored checkpoint directory once
+# produced a 125 GB archive temp file on the cluster.
 *.pt
 *.ckpt
+*.safetensors
 
-# Profiler traces: large, machine-specific, inspected in place or on Perfetto.
-*_trace.json
-*.pt.trace.json
+# Profiler artifacts. Raw chrome traces and CUDA memory snapshots are the bulk of
+# a run's bytes; bench/profile_stats.py reads the compact profiler_ops.csv that
+# sits beside them, so the heavy files never need to be committed.
+*.pickle
+profiler_trace.json
+profiler_trace.json.gz
 
-# Archives and bundles. Results are synced with rsync, not zipped.
-*.zip
-*.tar
+# Archives and logs produced by the cluster runbooks.
 *.tar.gz
-*.tgz
-results_bundle.*
-pull.*
+*.zip
+*.log
+
+# Personal meeting notes, not a repository artifact.
+MEETING_DELIVERY.md

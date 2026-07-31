@@ -5,11 +5,12 @@ parameters, so they contribute nothing to ``G``.  They only shape how the
 upstream gradient ``A`` propagates.  This is why the engine never needs to
 "port attention": attention's parameters are its four Linears.
 
-The ELU/MaxPool2d/Flatten rules below came from ``hadamard.py`` and are already
-covered by the legacy CIFAR gate.  Transformer-side rules (RoPE, SDPA,
-residual) are not needed as explicit entries -- ordinary autograd propagates
-``A`` through them once the engine is hook-driven rather than a manual reverse
-walk.  They are listed in ``docs/operator_table.md`` for completeness.
+The ELU/MaxPool2d/Flatten rules below are from the convolutional setting, where
+the engine walked layers manually and needed an explicit rule per op.  The
+hook-driven engine does not: ordinary autograd propagates ``A`` through every
+parameter-free op, so RoPE, SDPA and residual adds need no entry at all.  They
+are kept as the executable statement of II.6 and listed in
+``docs/operator_table.md``.
 """
 
 from __future__ import annotations

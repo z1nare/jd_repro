@@ -1,4 +1,0 @@
-torch>=2.7
-torchvision
-torchjd[quadprog_projector]>=0.17
-matplotlib

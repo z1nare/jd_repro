@@ -12,21 +12,23 @@ from typing import TypeAlias
 import torch
 from torch import nn
 
+LayoutEntry: TypeAlias = tuple[str, nn.Parameter, slice]
+
 
 def param_layout(model: nn.Module) -> list[LayoutEntry]:
-    layout:tuple[str, nn.Parameter, slice] = []
+    layout: list[LayoutEntry] = []
     offset = 0
-    seen :set(int) = set()
+    seen: set[int] = set()
 
-    for name, layer in model.named_parameters():
-        if not layer.requires_grad:
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
             continue
-        pid = id(layer)
+        pid = id(param)
         if pid in seen:
             continue
-        n = layer.numel()
-        layout.append((name, layer, slice(offset, offset+n)))
-        offset+=n
+        n = param.numel()
+        layout.append((name, param, slice(offset, offset + n)))
+        offset += n
         seen.add(pid)
     return layout
 
@@ -35,15 +37,13 @@ def num_params(layout: list[LayoutEntry]) -> int:
     """Total flat dimension P."""
     if not layout:
         return 0
-    # last slice's stop is P
     return layout[-1][2].stop
-
 
 
 def validate_layout(layout: list[LayoutEntry]) -> None:
     """Self-test invariants. Call once per model build."""
-    expected = 0 
-    seen_ids:set(int) = set()
+    expected = 0
+    seen_ids: set[int] = set()
     for name, param, sl in layout:
         assert sl.start == expected, f"gap before {name}: expected start {expected}, got {sl.start}"
         assert sl.stop - sl.start == param.numel(), f"slice size mismatch for {name}"
@@ -71,23 +71,21 @@ def flatten_grads(grads: list[torch.Tensor], layout: list[LayoutEntry]) -> torch
     return vec
 
 
-
 def flatten_grad_dict(
     grad_dict: dict[str, torch.Tensor],
     layout: list[LayoutEntry],
 ) -> torch.Tensor:
-    grads = [grad_dict[name] for name, _, _ in layout]    
+    grads = [grad_dict[name] for name, _, _ in layout]
     return flatten_grads(grads, layout)
 
 
 def unflatten(vec: torch.Tensor, layout: list[LayoutEntry]) -> dict[str, torch.Tensor]:
     if vec.numel() != num_params(layout):
-        raise ValueError(f"unflatten: vec length {vec.numel()} != P {P}")
-    out = {}
-    for name, params, sl in layout:
-        out[name] = vec[sl].view_as(params)
+        raise ValueError(f"unflatten: vec length {vec.numel()} != P {num_params(layout)}")
+    out: dict[str, torch.Tensor] = {}
+    for name, param, sl in layout:
+        out[name] = vec[sl].view_as(param)
     return out
-
 
 
 def layer_slices(layout: list[LayoutEntry]) -> dict[str, slice]:

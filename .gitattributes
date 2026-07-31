@@ -1,0 +1,24 @@
+# This repo is edited on Windows and executed on Linux. A shell script that
+# reaches the cluster with CRLF line endings fails immediately and cryptically --
+# bash reads `set -euo pipefail\r` and reports "invalid option name", or `$'\r':
+# command not found` on the first blank line. Pin LF for everything that is read
+# by an interpreter on the far side.
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.py    text eol=lf
+*.toml  text eol=lf
+*.cfg   text eol=lf
+*.md    text eol=lf
+*.csv   text eol=lf
+*.json  text eol=lf
+*.sbatch text eol=lf
+
+# Binary: never touch.
+*.png   binary
+*.pt    binary
+*.bin   binary
+*.zip   binary
+*.tar.gz binary
+*.pickle binary
+*.mat   binary

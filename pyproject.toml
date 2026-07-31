@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,19 +8,35 @@ version = "0.1.0"
 description = "Exact Gramian engines for Jacobian Descent"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.4"]
+dependencies = [
+    # 2.4 is the floor that matters: is_grads_batched, torch.func.vjp and the
+    # full-backward-hook signatures the engine relies on are all stable from
+    # there. The cluster runs 2.13; the gates pass on both.
+    "torch>=2.4",
+    "numpy",
+]
 
 [project.optional-dependencies]
-# The reference engine the gates compare against.
-torchjd = ["torchjd>=0.17"]
-# Legacy CIFAR harness only.
-cifar = ["torchvision", "matplotlib"]
-dev = ["pytest>=8"]
+# torchjd is the reference engine every gate and benchmark compares against, so
+# it is not optional in any meaningful sense -- it is separated only because the
+# library itself has no runtime dependency on it.
+bench = [
+    "torchjd>=0.17",
+    "matplotlib",
+    "pandas",
+]
+test = [
+    "pytest>=7.0",
+    "torchjd>=0.17",
+]
 
+# jdgram lives under src/; models/ stays at repo root (bench imports both).
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["jdgram*", "models*"]
+exclude = ["gates*", "bench*", "docs*", "scripts*", "results*"]
 
 [tool.pytest.ini_options]
+pythonpath = [".", "src"]
 testpaths = ["gates"]
-# Gate scripts import the package under test and the sandbox model.
-pythonpath = ["src", "."]
+addopts = "-q"

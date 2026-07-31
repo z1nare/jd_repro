@@ -113,13 +113,22 @@ def has_handler(module: nn.Module) -> bool:
 
 @register(nn.Linear)
 def linear_handler(module: nn.Linear, A: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+    from jdgram.engine.materialize import materialized_gramian
+    from jdgram.engine.router import route
+
+    m, T, _ = A.shape
+    P_layer = module.out_features * module.in_features
+    if route(m, T, P_layer) == "dfirst":
+        return materialized_gramian(A, X, module.bias is not None)
     return linear_id.sequence_gramian(A, X, module.bias is not None)
 
 
 @register(nn.Embedding)
 def token_embedding_handler(module: nn.Embedding, A: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
     # X is the index tensor the forward hook captured, not an activation.
-    return embedding_id.token_embedding_gramian(A, X)
+    return embedding_id.sequence_gramian(
+        A, X, num_embeddings=module.num_embeddings
+    )
 
 
 def positional_embedding_handler(

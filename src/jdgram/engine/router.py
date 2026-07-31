@@ -1,22 +1,43 @@
-"""PLACEHOLDER -- per-layer route selection (design doc I.3).
+"""Per-layer route selection between T-first contraction and d-first materialize.
 
-The reframed contribution is not "closed form everywhere".  It is one exact
-engine that picks the cheapest correct identity per layer::
+Both routes return the same Gramian; the choice is cost only. Analytic rule
+(until :mod:`jdgram.costmodel` loads measured crossovers)::
 
-    route(l) = closed form        if m*P_l >> (BT)^2 workspace
-                                  (vocab head, tied embedding, or large m)
-               materialize J J^T  if m*P_l is small
-                                  (interior linears at m <= 8)
+    tfirst  if  m · T²  <  P_layer
+    dfirst  otherwise
 
-Both routes are mathematically identical, so the choice is pure engineering --
-which is exactly why the crossover must come from ``jdgram.costmodel`` (i.e.
-from ``bench/crossover.py`` measurements) rather than from taste.  The
-selection rule *with* its measured crossover is the presentable systems result;
-the rule without measurements is an opinion.
+``P_layer`` is the layer's parameter count (e.g. ``d_out * d_in`` for Linear,
+``V * d`` for Embedding). At large vocab, tfirst wins; at interior linears
+with long T, dfirst is linear in T and usually cheaper.
+
+Force a side for gates via :func:`force_route` (``None`` restores the rule).
 """
 
 from __future__ import annotations
 
+from typing import Literal
 
-def route(*args, **kwargs):
-    raise NotImplementedError("cost-model routing: step 7 of the execution plan")
+Route = Literal["tfirst", "dfirst"]
+
+_force: Route | None = None
+
+
+def force_route(route: Route | None) -> None:
+    """Pin every :func:`route` decision, or ``None`` to clear."""
+    global _force
+    if route is not None and route not in ("tfirst", "dfirst"):
+        raise ValueError(f"unknown route {route!r}; expected 'tfirst', 'dfirst', or None")
+    _force = route
+
+
+def get_force_route() -> Route | None:
+    return _force
+
+
+def route(m: int, T: int, P_layer: int) -> Route:
+    """Pick contraction order for one layer."""
+    if _force is not None:
+        return _force
+    if P_layer <= 0:
+        raise ValueError(f"P_layer must be positive, got {P_layer}")
+    return "tfirst" if m * T * T < P_layer else "dfirst"

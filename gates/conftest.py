@@ -1,23 +1,93 @@
-"""PLACEHOLDER -- shared gate fixtures.
+"""Shared fixtures for transformer Gramian gates (design doc Part III, step 0).
 
-To implement:
-  * a ``gate_model`` fixture built from ``models.configs.gate_tiny``,
-    **parametrized over ``bias in (True, False)``** -- bias terms are separate
-    summands in every identity, so a bias-free gate can pass while the biased
-    path is wrong;
-  * fp64 default dtype for gates;
-  * ``dropout = 0.0`` asserted, not merely configured -- if the brute-force and
-    hooked passes see different networks the comparison is vacuous;
-  * a fixed seed, and ``torch.use_deterministic_algorithms`` where it does not
-    conflict with the ops under test.
-
-Standing rules for everything in this directory (design doc, Part III):
-  * every gate is a committed script -- these become the transformer preflight,
-    exactly as gates 1-4 became the CIFAR preflight;
-  * no step starts before the previous gate passes;
-  * on failure, shrink the hooked-module set before touching the math;
-  * no ``torch.compile`` until all gates pass eager -- it is a performance knob,
-    not a correctness tool.
+Every gate in this directory should use these fixtures so bias, dtype, dropout,
+and seed are consistent.  Nothing downstream is trustworthy until
+``test_0_brute_force_sanity`` passes for both bias variants.
 """
 
 from __future__ import annotations
+
+import pytest
+import torch
+
+from jdgram.utils.flatten import param_layout, validate_layout
+from models.configs import GateTinyConfig, build_gate_model, gate_batch
+
+# Fixed seeds — change only when intentionally refreshing reference values.
+GATE_SEED = 0
+DATA_SEED = 1
+
+
+@pytest.fixture(autouse=True)
+def _fp64_identity_workspace():
+    """Gates diff against float64 brute force at atol=1e-10; pin workspace."""
+    from jdgram.identities.precision import workspace_dtype
+
+    with workspace_dtype(torch.float64):
+        yield
+
+
+@pytest.fixture(params=[True, False], ids=["bias", "no-bias"])
+def bias(request: pytest.FixtureRequest) -> bool:
+    return request.param
+
+
+@pytest.fixture
+def gate_config(bias: bool) -> GateTinyConfig:
+    cfg = GateTinyConfig(bias=bias, dropout=0.0, tie_weights=False)
+    assert cfg.dropout == 0.0, "dropout must be 0.0 or BF and hooked passes diverge"
+    assert not cfg.tie_weights, "gates 5a-5d require an untied model"
+    return cfg
+
+
+@pytest.fixture
+def gate_model(gate_config: GateTinyConfig) -> torch.nn.Module:
+    torch.manual_seed(GATE_SEED)
+    model = build_gate_model(
+        bias=gate_config.bias,
+        tie_weights=False,
+        device="cpu",
+        dtype=torch.float64,
+    )
+    model.eval()
+    return model
+
+
+@pytest.fixture
+def gate_data(gate_config: GateTinyConfig) -> tuple[torch.Tensor, torch.Tensor]:
+    idx, targets = gate_batch(gate_config, seed=DATA_SEED, device="cpu")
+    assert idx.shape[0] == gate_config.m
+    assert idx.shape == targets.shape
+    assert idx.dtype == torch.long
+    assert targets.dtype == torch.long
+    return idx, targets
+
+
+@pytest.fixture
+def gate_layout(gate_model: torch.nn.Module):
+    layout = param_layout(gate_model)
+    validate_layout(layout)
+    assert layout[-1][2].stop > 0
+    return layout
+
+
+@pytest.fixture
+def tied_model(bias: bool) -> torch.nn.Module:
+    """Gate 5e only: wte.weight IS lm_head.weight, as upstream nanoGPT ships it."""
+    torch.manual_seed(GATE_SEED)
+    model = build_gate_model(
+        bias=bias,
+        tie_weights=True,
+        device="cpu",
+        dtype=torch.float64,
+    )
+    model.eval()
+    return model
+
+
+@pytest.fixture
+def tied_layout(tied_model: torch.nn.Module):
+    layout = param_layout(tied_model)
+    validate_layout(layout)
+    assert layout[-1][2].stop > 0
+    return layout

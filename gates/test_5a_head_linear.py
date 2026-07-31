@@ -1,14 +1,33 @@
-"""PLACEHOLDER -- Gate 5a: one Linear (``lm_head``), weight tying disabled.
+"""Gate 5a -- hook mechanism correct on one untied Linear (lm_head).
 
-Scope: hook plumbing (:mod:`jdgram.engine.hooks` + :mod:`jdgram.engine.node`)
-registered on ``lm_head`` **only**, using the naive einsum form of II.1.
+Compares against the per-layer brute-force block, not full G_true: G_true
+includes every other parameter's contribution.
 
-Assert: the engine's contribution for ``lm_head.weight`` matches the
-brute-force Jacobian of that parameter alone, atol ~ 1e-10 at fp64.
-
-Delete the tying line in the model for this gate -- tying is gate 5e.
+lm_head is constructed bias=False in nanoGPT regardless of config.bias, so the
+bias path is not exercised here -- gate 5b is where that first happens.
 """
 
-import pytest
+from __future__ import annotations
 
-pytest.skip("gate 5a not yet implemented", allow_module_level=True)
+import torch
+
+from gates._helpers import run_engine
+from gates.brute_force import true_gramian
+
+
+def test_5a_head_linear(gate_model, gate_data, gate_layout):
+    idx, targets = gate_data
+    _, _, g_by_layer = true_gramian(gate_model, idx, targets, layout=gate_layout)
+
+    modules = {"lm_head": gate_model.lm_head}
+    result = run_engine(gate_model, idx, targets, modules)
+
+    expected = g_by_layer["lm_head.weight"]
+    torch.testing.assert_close(
+        result.per_module["lm_head"], expected, rtol=0, atol=1e-10
+    )
+    torch.testing.assert_close(result.total, expected, rtol=0, atol=1e-10)
+
+
+def test_5a_head_has_no_bias(gate_model):
+    assert gate_model.lm_head.bias is None

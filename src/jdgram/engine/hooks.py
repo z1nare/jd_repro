@@ -1,34 +1,44 @@
-"""Hook plumbing: capture (A, X) per layer, then fire each layer's identity.
+"""Hook-driven Gramian engine: three reverse drivers behind one entry point.
 
-Hook injection, the forward-phase flag and the pytree handling of module outputs
-are ported from TorchJD 0.17.0 ``torchjd/autogram/_module_hook_manager.py``
-(``ModuleHookManager``, ``BoolRef``, ``Hook``), MIT licence, (c) Valerian Rey,
-Pierre Quinton.
+``compute_gramian`` is the whole public surface.  What changes between drivers is
+only *how the per-objective upstream gradient ``A`` is obtained*, and *when* each
+layer's ``[m, m]`` contribution is formed:
 
-Orchestration (decided and verified before this module was written, and the one
-part that deliberately differs from upstream):
+``squashed`` (default)
+    One **ordinary** backward seeded with ``ones(m)``.  With per-instance losses
+    and batch-independent modules the intermediate Jacobians are block-diagonal,
+    so ``d(sum_i L_i)/dz[i] == dL_i/dz[i]``: row ``i`` of the gradient that
+    arrives at a layer output *is* objective ``i``'s upstream gradient, with no
+    replication anywhere.  Each layer's identity fires inside its own backward and
+    its captures are dropped immediately (:mod:`jdgram.engine.accumulate`), so the
+    engine holds one layer's ``(A, X)`` at a time.  This is TorchJD autogram's
+    strategy; the reason it is 5-10x leaner than what jdgram used to do.
 
-* ONE shared forward pass. ``X`` is identical across objectives, so each
-  module's forward hook fires once and stores its input once.
-* m SEPARATE reverse passes, one per objective. A module that treats batch
-  elements independently sees an upstream gradient that is nonzero only at batch
-  row ``i`` on pass ``i``, so the driver keeps that row and stacks across passes.
-* Identities fire ONCE per module, after the loop -- not incrementally.
+``batched``
+    One ``is_grads_batched`` backward seeded with ``eye(m)``.  Correct, and the
+    honest way to get ``A`` when the block-diagonal assumption does not hold -- but
+    ``vmap`` replicates the *entire* reverse working set ``m`` times, and each
+    layer's returned gradient is ``[m, m, ...]`` of which only the diagonal is
+    used.  Costs ``O(m)`` more memory than ``squashed`` for the same answer.  Kept
+    as the reference the gates A/B against, and as the fallback for models with
+    unbatched hooked modules.
 
-TorchJD instead vmaps a single reverse pass and accumulates inside
-``backward``, which is strictly better at scale but couples the identity to the
-autograd internals. The loop here mirrors ``gates/brute_force.py``'s own
-structure, which is exactly what lets a gate diff the two cleanly: same loop
-shape, different inner computation. Upstream's streaming
-``remaining_counter`` is a memory optimisation for real shapes (step 6+), not a
-correctness requirement at gate sizes.
+``loop``
+    ``m`` separate backwards, one objective seeded per pass.  Cheapest in memory,
+    ``m`` times the time.  The CPU/debug path.
+
+All three produce the same ``G``; gate 5f pins them together.
+
+Hook injection, the phase flag and gradient-edge bookkeeping are ported from
+TorchJD 0.17.0 ``autogram`` (MIT, (c) Valerian Rey, Pierre Quinton).
 """
 
 from __future__ import annotations
 
 import weakref
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Literal
 
 import torch
 from torch import Tensor, nn
@@ -37,6 +47,7 @@ from torch.overrides import is_tensor_like
 from torch.utils._pytree import PyTree, tree_flatten, tree_unflatten
 from torch.utils.hooks import RemovableHandle
 
+from jdgram.engine.accumulate import GramianAccumulator, SharedGroup
 from jdgram.engine.edges import EdgeRegistry
 from jdgram.engine.node import GramianNode
 from jdgram.engine.registry import (
@@ -45,6 +56,11 @@ from jdgram.engine.registry import (
     dispatch,
     find_shared_parameters,
 )
+from jdgram.engine.router import force_route as set_force_route
+from jdgram.engine.router import get_force_route
+from jdgram.identities.precision import workspace_dtype as workspace_dtype_ctx
+
+Driver = Literal["squashed", "batched", "loop"]
 
 
 class BoolRef:
@@ -58,35 +74,8 @@ class BoolRef:
 
 
 @dataclass
-class ModuleCapture:
-    """Everything the engine records for one hooked module."""
-
-    name: str
-    module: nn.Module
-    forward_calls: int = 0
-    inputs: list[PyTree] = field(default_factory=list)
-    output_shapes: list[torch.Size] = field(default_factory=list)
-    grads: list[tuple[Tensor, ...]] = field(default_factory=list)
-
-    def record_forward(self, args: tuple[PyTree, ...], outputs: list[Tensor]) -> None:
-        self.forward_calls += 1
-        self.inputs.append(args[0] if args else None)
-        self.output_shapes.append(outputs[0].shape)
-
-    def record_backward(self, grad_outputs: tuple[Tensor, ...]) -> None:
-        self.grads.append(grad_outputs)
-
-    def clear_grads(self) -> None:
-        self.grads.clear()
-
-
-@dataclass
 class LayerCapture:
-    """Per-module captures assembled across the m reverse passes.
-
-    Handed to identity handlers, and to the shared-parameter handlers that gate
-    5e supplies for weight tying.
-    """
+    """Per-module ``(A, X)`` handed to identity and shared-group handlers."""
 
     name: str
     module: nn.Module
@@ -95,10 +84,122 @@ class LayerCapture:
 
 
 @dataclass
+class ModuleCapture:
+    """Everything the engine records for one hooked module.
+
+    Under ``squashed`` this object is also the streaming site: ``record_backward``
+    forms the ``[m, m]`` contribution and releases ``inputs`` on the spot, so the
+    capture is empty again before the reverse pass reaches the next layer.
+    """
+
+    name: str
+    module: nn.Module
+    forward_calls: int = 0
+    inputs: list[PyTree] = field(default_factory=list)
+    output_shapes: list[torch.Size] = field(default_factory=list)
+    grads: list[tuple[Tensor, ...]] = field(default_factory=list)
+    # Wrapped outputs (GramianNode results). The batched driver reads ``A`` from
+    # ``autograd.grad(..., inputs=rg_outputs)`` return values, not side effects.
+    rg_outputs: list[Tensor] = field(default_factory=list)
+    # Set only for the streaming driver.
+    stream: "_StreamTarget | None" = None
+    # Only the loop driver needs the backward side effect. The batched driver
+    # reads ``A`` from returned grads and ignores whatever lands here, so keeping
+    # a copy of every module's vmap slice would be pure waste.
+    collect: bool = False
+
+    def record_forward(self, args: tuple[PyTree, ...], outputs: list[Tensor]) -> None:
+        self.forward_calls += 1
+        self.inputs.append(args[0] if args else None)
+        self.output_shapes.append(outputs[0].shape)
+
+    def record_backward(self, grad_outputs: tuple[Tensor, ...]) -> None:
+        if self.stream is not None:
+            self.stream.consume(self, grad_outputs)
+        elif self.collect:
+            # clone, not detach: the loop driver holds these past the backward
+            # call, and aten::detach has no vmap batching rule.
+            self.grads.append(tuple(g.clone() for g in grad_outputs))
+
+    def take_input(self) -> PyTree:
+        """Pop the forward capture, detached. Detaching is load-bearing: ``X``
+        still sits on the forward graph, and feeding it to an identity makes ``G``
+        require grad, forming a capture->GramianNode->graph cycle that leaks one
+        forward per step (~GB on a transformer) until OOM."""
+        x = self.inputs.pop(0) if self.inputs else None
+        if is_tensor_like(x):
+            x = x.detach()
+        return x
+
+    def clear_grads(self) -> None:
+        self.grads.clear()
+
+
+@dataclass
 class GramianResult:
     total: Tensor
     per_module: dict[str, Tensor]
     per_shared_group: dict[frozenset[str], Tensor]
+    #: Bytes of captures simultaneously pinned at the streaming high-water mark.
+    #: Zero for an untied model under ``squashed`` -- every layer frees on the spot.
+    peak_held_bytes: int = 0
+    driver: str = "squashed"
+
+
+class _StreamTarget:
+    """Fires a module's identity from inside its backward, then frees its captures."""
+
+    def __init__(
+        self,
+        accumulator: GramianAccumulator,
+        handlers: dict[str, IdentityHandler],
+        groups: dict[str, SharedGroup],
+    ) -> None:
+        self.accumulator = accumulator
+        self.handlers = handlers
+        self.groups = groups
+        self.peak_held_bytes = 0
+        self.visited: set[str] = set()
+
+    def _note_held(self) -> None:
+        held = sum(g.held_bytes() for g in set(self.groups.values()))
+        self.peak_held_bytes = max(self.peak_held_bytes, held)
+
+    def consume(self, capture: ModuleCapture, grad_outputs: tuple[Tensor, ...]) -> None:
+        name = capture.name
+        if len(grad_outputs) != 1:
+            raise NotImplementedError(
+                f"{name}: {len(grad_outputs)} differentiable outputs. Multi-output "
+                f"modules need an identity that consumes all of them."
+            )
+        if name in self.visited:
+            raise NotImplementedError(
+                f"{name}: reached twice in one reverse pass. Streaming accumulation "
+                f"needs a summed-Jacobian formulation for multi-call modules "
+                f"(TorchJD's remaining_counter); use driver='loop' meanwhile."
+            )
+        self.visited.add(name)
+
+        group = self.groups.get(name)
+        A = grad_outputs[0].detach()
+        if group is not None:
+            # Only a tied group outlives this backward call, so only it pays for
+            # a copy; autograd is free to reuse the buffer once we return.
+            A = A.clone()
+        layer = LayerCapture(
+            name=name,
+            module=capture.module,
+            A=A,
+            X=capture.take_input(),
+        )
+        if group is None:
+            handler = self.handlers[name]
+            self.accumulator.add_module(name, handler(layer.module, layer.A, layer.X))
+            return
+        contribution = group.submit(layer)
+        self._note_held()
+        if contribution is not None:
+            self.accumulator.add_group(group.names, contribution)
 
 
 class _Hook:
@@ -143,6 +244,7 @@ class _Hook:
         self.register_edge(get_gradient_edge(smallest))
 
         wrapped = GramianNode.apply(self.capture, *rg_outputs)
+        self.capture.rg_outputs = list(wrapped)
         for i, out in zip(rg_indices, wrapped, strict=True):
             flat_outputs[i] = out
         return tree_unflatten(flat_outputs, output_spec)
@@ -151,9 +253,9 @@ class _Hook:
 class ModuleHookManager:
     """Installs and owns the forward hooks for a set of modules.
 
-    Hooks are removed via ``weakref.finalize``: a live hook keeps the graph
-    alive through the nodes that reference it, and those form a reference cycle
-    the collector will not break on its own.
+    Hooks are removed via ``weakref.finalize``: a live hook keeps the graph alive
+    through the nodes that reference it, and those form a reference cycle the
+    collector will not break on its own.
     """
 
     def __init__(self, target_edges: EdgeRegistry) -> None:
@@ -195,16 +297,17 @@ def _is_batched(capture: ModuleCapture, m: int) -> bool:
     lead with a dimension of size m and objective ``i``'s gradient lives at row
     ``i``.
 
-    A position embedding is the exception: it is called with a bare ``[T]``
-    position vector and its ``[T, d]`` output broadcasts over the batch.
-    Autograd's broadcast-backward has already summed over the batch by the time
-    the hook sees the gradient -- and since only row ``i`` was seeded on pass
-    ``i``, that sum *is* objective ``i``'s gradient. So the capture is taken
-    whole rather than indexed.
+    A position embedding called with a bare ``[T]`` vector is the exception: its
+    ``[T, d]`` output broadcasts over the batch, and autograd's broadcast-backward
+    has already summed over the batch by the time the hook sees the gradient.
+    Under the ``loop`` driver only row ``i`` was seeded, so that sum *is*
+    objective ``i``'s gradient and the capture is taken whole.  Under ``squashed``
+    every objective is seeded at once, so the sum is *not* recoverable -- which is
+    why that driver rejects unbatched modules outright.
 
-    Requiring both input and output to lead with m keeps that case out. The rule
-    is only ambiguous when the sequence length equals m; pass
-    ``batched_overrides`` if you hit that.
+    Requiring both input and output to lead with m keeps that case out.  The rule
+    is only ambiguous when the sequence length equals m; pass ``batched_overrides``
+    if you hit that.
     """
     output_shape = capture.output_shapes[0]
     input_value = capture.inputs[0]
@@ -219,6 +322,176 @@ def _objective_slice(grad: Tensor, i: int, batched: bool) -> Tensor:
     return grad[i] if batched else grad
 
 
+def _assemble_A(grad: Tensor, batched: bool) -> Tensor:
+    """Build ``A: [m, ...]`` from one ``is_grads_batched`` capture (leading m).
+
+    Batched modules yield ``[m, m, ...]`` (vmap x batch); take the diagonal
+    ``A[i] = grad[i, i, ...]``. Unbatched (e.g. an unbatched wpe) already have
+    ``A = grad``.
+    """
+    m = grad.shape[0]
+    if batched:
+        if grad.shape[1] != m:
+            raise RuntimeError(
+                f"batched is_grads_batched capture expected [m, m, ...], got {tuple(grad.shape)}"
+            )
+        idx = torch.arange(m, device=grad.device)
+        return grad[idx, idx]
+    return grad
+
+
+def _differentiation_inputs(leaf_edges: list, manager: ModuleHookManager) -> list:
+    """Targets that force the reverse pass through every injected node."""
+    if leaf_edges:
+        return leaf_edges
+    inputs: list[Tensor] = []
+    for name, cap in manager.captures.items():
+        if not cap.rg_outputs:
+            raise RuntimeError(f"{name}: missing rg_outputs; the forward did not run hooked")
+        inputs.append(cap.rg_outputs[0])
+    return inputs
+
+
+def _reverse_squashed(
+    *,
+    losses: Tensor,
+    leaf_edges: list,
+    manager: ModuleHookManager,
+) -> None:
+    """One ordinary backward, ``grad_outputs = ones(m)``.
+
+    Nothing is returned: every layer's contribution was accumulated from inside
+    its own backward.  ``retain_graph=False`` lets autograd free activations as
+    the sweep proceeds, which is a large part of the memory win.
+    """
+    torch.autograd.grad(
+        outputs=losses,
+        inputs=_differentiation_inputs(leaf_edges, manager),
+        grad_outputs=torch.ones_like(losses),
+        retain_graph=False,
+        allow_unused=True,
+    )
+
+
+def _reverse_loop(
+    *,
+    m: int,
+    losses: Tensor,
+    model: nn.Module,
+    leaf_edges: list,
+    manager: ModuleHookManager,
+    modules: dict[str, nn.Module],
+    batched: dict[str, bool],
+) -> dict[str, Tensor]:
+    """Legacy m reverse passes -- gate/debug path."""
+    stacked: dict[str, list[Tensor]] = {name: [] for name in modules}
+    for i in range(m):
+        for capture in manager.captures.values():
+            capture.clear_grads()
+
+        retain = i < m - 1
+        if leaf_edges:
+            torch.autograd.grad(
+                outputs=losses[i],
+                inputs=leaf_edges,
+                retain_graph=retain,
+                allow_unused=True,
+            )
+        else:
+            model.zero_grad(set_to_none=True)
+            losses[i].backward(retain_graph=retain)
+
+        for name, capture in manager.captures.items():
+            if len(capture.grads) != 1:
+                raise RuntimeError(
+                    f"{name}: expected 1 backward capture on objective {i}, got "
+                    f"{len(capture.grads)}. Zero means the module is off this objective's "
+                    f"reverse path; more than one means it was reached repeatedly."
+                )
+            grad_outputs = capture.grads[0]
+            if len(grad_outputs) != 1:
+                raise NotImplementedError(
+                    f"{name}: {len(grad_outputs)} differentiable outputs. Multi-output "
+                    f"modules need an identity that consumes all of them."
+                )
+            stacked[name].append(
+                _objective_slice(grad_outputs[0], i, batched[name])
+            )
+    return {name: torch.stack(parts) for name, parts in stacked.items()}
+
+
+def _reverse_batched(
+    *,
+    m: int,
+    losses: Tensor,
+    leaf_edges: list,
+    manager: ModuleHookManager,
+    batched: dict[str, bool],
+) -> dict[str, Tensor]:
+    """Single reverse pass: seed all m objectives via ``is_grads_batched``.
+
+    ``A`` is taken from returned grads w.r.t. each module's wrapped outputs.
+    Hooks / ``GramianNode.backward`` only see an unbatched slice under
+    ``is_grads_batched``, so side-effect capture cannot build ``[m, ...]``.
+    ``leaf_edges`` is unused here but kept for call-site symmetry with the loop.
+    """
+    del leaf_edges  # traversal is forced by differentiating all rg_outputs
+    for capture in manager.captures.values():
+        capture.clear_grads()
+
+    names = list(manager.captures)
+    grad_inputs: list[Tensor] = []
+    for name in names:
+        cap = manager.captures[name]
+        if not cap.rg_outputs:
+            raise RuntimeError(f"{name}: missing rg_outputs for batched reverse")
+        if len(cap.rg_outputs) != 1:
+            raise NotImplementedError(
+                f"{name}: {len(cap.rg_outputs)} differentiable outputs. Multi-output "
+                f"modules need an identity that consumes all of them."
+            )
+        grad_inputs.append(cap.rg_outputs[0])
+
+    eye = torch.eye(m, device=losses.device, dtype=losses.dtype)
+    grads = torch.autograd.grad(
+        outputs=losses,
+        inputs=grad_inputs,
+        grad_outputs=eye,
+        is_grads_batched=True,
+        retain_graph=False,
+        allow_unused=True,
+    )
+    out: dict[str, Tensor] = {}
+    for name, grad in zip(names, grads, strict=True):
+        if grad is None:
+            raise RuntimeError(
+                f"{name}: no gradient under is_grads_batched. The module is off "
+                f"every objective's reverse path."
+            )
+        if grad.shape[0] != m:
+            raise RuntimeError(
+                f"{name}: expected leading dim m={m} from is_grads_batched, "
+                f"got {tuple(grad.shape)}"
+            )
+        out[name] = _assemble_A(grad, batched[name])
+    return out
+
+
+def _resolve_driver(driver: Driver | None, batched_backward: bool | None) -> Driver:
+    """``batched_backward`` is the pre-driver spelling; keep it working."""
+    if driver is not None and batched_backward is not None:
+        raise ValueError("pass either driver= or batched_backward=, not both")
+    if driver is not None:
+        if driver not in ("squashed", "batched", "loop"):
+            raise ValueError(
+                f"unknown driver {driver!r}; expected 'squashed', 'batched' or 'loop'"
+            )
+        return driver
+    if batched_backward is not None:
+        return "batched" if batched_backward else "loop"
+    return "squashed"
+
+
 def compute_gramian(
     model: nn.Module,
     compute_losses: Callable[[], Tensor],
@@ -228,11 +501,15 @@ def compute_gramian(
     shared_handlers: dict[frozenset[str], Callable[[dict[str, LayerCapture]], Tensor]] | None = None,
     batched_overrides: dict[str, bool] | None = None,
     use_leaf_edges: bool = True,
+    driver: Driver | None = None,
+    batched_backward: bool | None = None,
+    force_route: str | None = None,
+    workspace_dtype: torch.dtype | None = None,
 ) -> GramianResult:
     """Exact Gramian of the m objectives, accumulated per hooked module.
 
-    :param compute_losses: runs the forward pass and returns the ``[m]`` vector
-        of per-objective losses. Passed as a callable so this package stays
+    :param compute_losses: runs the forward pass and returns the ``[m]`` vector of
+        per-objective losses. Passed as a callable so this package stays
         independent of any particular model or loss construction.
     :param modules: hooked set; defaults to every module owning trainable
         parameters directly.
@@ -244,23 +521,55 @@ def compute_gramian(
         per-module Gramians are only additive for disjoint parameters, so summing
         them across a tied pair drops the cross terms.
     :param batched_overrides: force the objective-slicing rule for a module.
+    :param driver: ``"squashed"`` (default), ``"batched"`` or ``"loop"``; see the
+        module docstring. ``squashed`` requires every hooked module to be batched
+        on dim 0 and to treat batch elements independently.
+    :param batched_backward: deprecated spelling. ``True`` -> ``"batched"``,
+        ``False`` -> ``"loop"``.
+    :param force_route: thin adapter over :func:`jdgram.engine.router.force_route`.
+        ``None`` leaves the current router force unchanged; ``"tfirst"`` /
+        ``"dfirst"`` pins every layer for this call and restores afterward.
+    :param workspace_dtype: thin adapter over
+        :func:`jdgram.identities.precision.workspace_dtype`. ``None`` leaves the
+        process default (fp32, or whatever gates pinned). Final ``[m, m]`` still
+        accumulates in float64.
 
-    ``per_module`` is what per-layer gates diff against brute force's
-    per-parameter blocks, so a failure names its layer instead of only reporting
-    that the total is wrong.
+    ``per_module`` is what per-layer gates diff against brute force's per-parameter
+    blocks, so a failure names its layer instead of only reporting that the total
+    is wrong.
     """
-    handler_overrides = handler_overrides or {}
-    shared_handlers = shared_handlers or {}
-    batched_overrides = batched_overrides or {}
+    resolved = _resolve_driver(driver, batched_backward)
+    prev_force = get_force_route()
+    try:
+        if force_route is not None:
+            set_force_route(force_route)  # type: ignore[arg-type]
+        ctx = (
+            workspace_dtype_ctx(workspace_dtype)
+            if workspace_dtype is not None
+            else nullcontext()
+        )
+        with ctx:
+            return _compute_gramian_body(
+                model,
+                compute_losses,
+                modules=modules,
+                handler_overrides=handler_overrides,
+                shared_handlers=shared_handlers,
+                batched_overrides=batched_overrides,
+                use_leaf_edges=use_leaf_edges,
+                driver=resolved,
+            )
+    finally:
+        set_force_route(prev_force)
 
-    if modules is None:
-        modules = collect_hookable_modules(model)
-    if not modules:
-        raise ValueError("no hookable modules: nothing owns trainable parameters")
 
-    shared = find_shared_parameters(modules)
-    grouped_names: dict[str, frozenset[str]] = {}
-    for param_name, owners in shared.items():
+def _resolve_groups(
+    modules: dict[str, nn.Module],
+    shared_handlers: dict[frozenset[str], Callable],
+) -> dict[str, frozenset[str]]:
+    """Map each tied module name to its group, refusing to guess when untold."""
+    grouped: dict[str, frozenset[str]] = {}
+    for param_name, owners in find_shared_parameters(modules).items():
         group = frozenset(owners)
         if group not in shared_handlers:
             raise ValueError(
@@ -271,8 +580,32 @@ def compute_gramian(
                 f"(design doc II.4), or run on an untied model."
             )
         for owner in owners:
-            grouped_names[owner] = group
+            grouped[owner] = group
+    return grouped
 
+
+def _compute_gramian_body(
+    model: nn.Module,
+    compute_losses: Callable[[], Tensor],
+    *,
+    modules: dict[str, nn.Module] | None,
+    handler_overrides: dict[str, IdentityHandler] | None,
+    shared_handlers: dict[frozenset[str], Callable[[dict[str, LayerCapture]], Tensor]] | None,
+    batched_overrides: dict[str, bool] | None,
+    use_leaf_edges: bool,
+    driver: Driver,
+) -> GramianResult:
+    handler_overrides = handler_overrides or {}
+    shared_handlers = shared_handlers or {}
+    batched_overrides = batched_overrides or {}
+
+    if modules is None:
+        modules = collect_hookable_modules(model)
+    if not modules:
+        raise ValueError("no hookable modules: nothing owns trainable parameters")
+
+    grouped_names = _resolve_groups(modules, shared_handlers)
+    accumulator = GramianAccumulator()
     target_edges = EdgeRegistry()
 
     with ModuleHookManager(target_edges) as manager:
@@ -308,75 +641,123 @@ def compute_gramian(
             for name, cap in manager.captures.items()
         }
 
+        if driver == "squashed":
+            unbatched = sorted(name for name, is_b in batched.items() if not is_b)
+            if unbatched:
+                raise ValueError(
+                    f"driver='squashed' needs every hooked module batched on dim 0, but "
+                    f"{unbatched} are not. A single ones-seeded backward sums over objectives "
+                    f"at an unbatched module, so per-objective gradients are unrecoverable "
+                    f"there. Fix the forward so the module sees a batched input (a position "
+                    f"embedding wants pos expanded to [B, T], not [T]), pass batched_overrides "
+                    f"if the m == T shape rule misfired, or use driver='batched'."
+                )
+
         leaf_edges: list = []
         if use_leaf_edges and len(target_edges) > 0:
             leaf_edges = list(target_edges.get_leaf_edges({get_gradient_edge(losses)}))
 
-        stacked: dict[str, list[Tensor]] = {name: [] for name in modules}
+        stream: _StreamTarget | None = None
+        if driver == "squashed":
+            groups = {}
+            built: dict[frozenset[str], SharedGroup] = {}
+            for name, group in grouped_names.items():
+                if group not in built:
+                    built[group] = SharedGroup(group, shared_handlers[group])
+                groups[name] = built[group]
+            for group in shared_handlers:
+                if not group <= set(modules):
+                    raise KeyError(f"shared_handlers group {sorted(group)} is not fully hooked")
+            handlers = {
+                name: (handler_overrides.get(name) or dispatch(mod))
+                for name, mod in modules.items()
+                if name not in grouped_names
+            }
+            stream = _StreamTarget(accumulator, handlers, groups)
+            for capture in manager.captures.values():
+                capture.stream = stream
+        elif driver == "loop":
+            for capture in manager.captures.values():
+                capture.collect = True
 
         manager.phase.value = True
         try:
-            for i in range(m):
-                for capture in manager.captures.values():
-                    capture.clear_grads()
-
-                retain = i < m - 1
-                if leaf_edges:
-                    torch.autograd.grad(
-                        outputs=losses[i],
-                        inputs=leaf_edges,
-                        retain_graph=retain,
-                        allow_unused=True,
-                    )
-                else:
-                    model.zero_grad(set_to_none=True)
-                    losses[i].backward(retain_graph=retain)
-
-                for name, capture in manager.captures.items():
-                    if len(capture.grads) != 1:
-                        raise RuntimeError(
-                            f"{name}: expected 1 backward capture on objective {i}, got "
-                            f"{len(capture.grads)}. Zero means the module is off this objective's "
-                            f"reverse path; more than one means it was reached repeatedly."
-                        )
-                    grad_outputs = capture.grads[0]
-                    if len(grad_outputs) != 1:
-                        raise NotImplementedError(
-                            f"{name}: {len(grad_outputs)} differentiable outputs. Multi-output "
-                            f"modules need an identity that consumes all of them."
-                        )
-                    stacked[name].append(
-                        _objective_slice(grad_outputs[0], i, batched[name])
-                    )
+            if driver == "squashed":
+                # Identities run inside GramianNode.backward, under no_grad.
+                _reverse_squashed(losses=losses, leaf_edges=leaf_edges, manager=manager)
+                A_by_name = None
+            elif driver == "batched":
+                A_by_name = _reverse_batched(
+                    m=m, losses=losses, leaf_edges=leaf_edges,
+                    manager=manager, batched=batched,
+                )
+            else:
+                A_by_name = _reverse_loop(
+                    m=m, losses=losses, model=model, leaf_edges=leaf_edges,
+                    manager=manager, modules=modules, batched=batched,
+                )
         finally:
             manager.phase.value = False
+            for capture in manager.captures.values():
+                capture.stream = None
+                capture.collect = False
+
+        if driver == "squashed":
+            missed = sorted(set(modules) - stream.visited)  # type: ignore[union-attr]
+            if missed:
+                raise RuntimeError(
+                    f"never reached during the reverse pass: {missed}. They are hooked and were "
+                    f"called on the forward, so the loss does not depend on them."
+                )
+            for capture in manager.captures.values():
+                capture.inputs.clear()
+                capture.rg_outputs.clear()
+                capture.clear_grads()
+            if accumulator.total is None:
+                raise RuntimeError("no Gramian contributions were accumulated")
+            return GramianResult(
+                total=accumulator.total.detach(),
+                per_module=accumulator.per_module,
+                per_shared_group=accumulator.per_shared_group,
+                peak_held_bytes=stream.peak_held_bytes,  # type: ignore[union-attr]
+                driver=driver,
+            )
 
         layers: dict[str, LayerCapture] = {}
         for name, capture in manager.captures.items():
             layers[name] = LayerCapture(
                 name=name,
                 module=capture.module,
-                A=torch.stack(stacked[name]),
-                X=capture.inputs[0],
+                A=A_by_name[name].detach(),  # type: ignore[index]
+                X=capture.take_input(),
             )
+            capture.rg_outputs.clear()
+            capture.clear_grads()
 
-    per_module: dict[str, Tensor] = {}
-    per_shared_group: dict[frozenset[str], Tensor] = {}
-
+    held = 0
     for name, layer in layers.items():
-        if name in grouped_names:
-            continue
-        handler = handler_overrides.get(name) or dispatch(layer.module)
-        per_module[name] = handler(layer.module, layer.A, layer.X)
+        for tensor in (layer.A, layer.X):
+            if torch.is_tensor(tensor):
+                held += tensor.numel() * tensor.element_size()
 
-    for group, handler in shared_handlers.items():
-        if not group <= set(layers):
-            raise KeyError(f"shared_handlers group {sorted(group)} is not fully hooked")
-        per_shared_group[group] = handler({name: layers[name] for name in group})
+    with torch.no_grad():
+        for name, layer in layers.items():
+            if name in grouped_names:
+                continue
+            handler = handler_overrides.get(name) or dispatch(layer.module)
+            accumulator.add_module(name, handler(layer.module, layer.A, layer.X))
 
-    contributions = list(per_module.values()) + list(per_shared_group.values())
-    total = contributions[0]
-    for contribution in contributions[1:]:
-        total = total + contribution
+        for group, handler in shared_handlers.items():
+            if not group <= set(layers):
+                raise KeyError(f"shared_handlers group {sorted(group)} is not fully hooked")
+            accumulator.add_group(group, handler({name: layers[name] for name in group}))
 
-    return GramianResult(total=total, per_module=per_module, per_shared_group=per_shared_group)
+    if accumulator.total is None:
+        raise RuntimeError("no Gramian contributions were accumulated")
+    return GramianResult(
+        total=accumulator.total.detach(),
+        per_module=accumulator.per_module,
+        per_shared_group=accumulator.per_shared_group,
+        peak_held_bytes=held,
+        driver=driver,
+    )

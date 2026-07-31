@@ -8,10 +8,13 @@ layer's upstream gradient ``A`` is observable at the exact point in the reverse
 pass where it is live, without holding the whole Jacobian anywhere.
 
 Divergence from upstream: TorchJD fires the Gramian computation *inside*
-``backward`` and accumulates immediately.  Here ``backward`` only hands the
-gradients to a capture object; the identities fire once per module after the
-driver's m-objective loop.  That is a deliberate gate-scale simplification --
-see :mod:`jdgram.engine.hooks` for the orchestration and why.
+``backward`` and accumulates immediately.  Here the loop driver
+(``batched_backward=False``) only hands gradients to a capture object;
+identities fire once per module after the reverse pass.  The default
+``is_grads_batched`` driver does *not* use this side effect for ``A`` —
+under ``is_grads_batched``, ``backward`` only sees an unbatched slice — and
+instead reads returned grads w.r.t. the wrapped outputs.  See
+:mod:`jdgram.engine.hooks`.
 """
 
 from __future__ import annotations
@@ -43,7 +46,14 @@ class GramianNode(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Tensor) -> tuple:
-        ctx.sink.record_backward(tuple(g.detach() for g in grad_outputs))
+        # Handed over as-is. Copying is the sink's decision, because only the
+        # sink knows whether it outlives this call: the streaming driver consumes
+        # the gradient here and now, the loop driver holds it past the call and
+        # therefore clones, and the batched driver ignores it entirely. Cloning
+        # unconditionally used to cost one full copy of every module's upstream
+        # gradient on every driver, including the two that never read it.
+        with torch.no_grad():
+            ctx.sink.record_backward(grad_outputs)
         # Pass gradients through untouched: this node must not perturb the
         # reverse pass it is observing.
         return None, *grad_outputs
