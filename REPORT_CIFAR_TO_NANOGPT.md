@@ -6,10 +6,10 @@ with `T = 1`. This report carries that work to a transformer, where the central
 assumption of the CIFAR result no longer holds, and re-measures everything
 against TorchJD 0.17.
 
-**Provenance.** §0–§7 and §9–§11 are from run tag `v8_20260731-*` on gala1; §8 is
-from `v9_20260731-*` on fuji2 and is a **run still in progress**. The two boxes
-carry different torch builds, so ratios hold within a version and absolute
-timings do not transfer across them.
+**Provenance.** §0–§7 and §9–§11 are from run tag `v8_20260731-*` on gala1
+(25 runs); §8 is from `v9_20260731-*` on fuji2 (20 runs, campaign complete). The
+two boxes carry different torch builds, so ratios hold within a version and
+absolute timings do not transfer across them.
 
 gala1 is an NVIDIA RTX A5000, 24 GiB, torch 2.13.0+cu130, torchjd 0.17.0,
 Python 3.10.12; fuji2 is 4x RTX A5000 24 GiB on torch 2.4.1+cu121. Both run an
@@ -39,14 +39,18 @@ this report says why: it was earned under `T = 1`.
 router picks the wrong route, costing **2.8× in time** for a memory saving that
 never materialises. Fixing it is the single highest-value item outstanding.
 
-**Now measured at full GPT-2 124M** (§8, run in progress): `autojac` stops
-fitting on a 24 GiB card **between m=7 and m=8** at T=512, and OOMs at
-m=8/T=1024, while both Gramian engines keep running — the first direct evidence
-that there is a size where materialising `[m, P]` is impossible and this approach
-is not. jdgram is exact there (**4.0e-08** against brute force) and runs at
-**0.72–0.75×** `autogram`'s peak untied. Two honest corrections come with it: the
-tied-memory advantage of §7.1 **reverses** at this scale, and the router is
-*right* at small `m·T²` and wrong only as it grows.
+**Now measured at full GPT-2 124M** (§8): `autojac` stops fitting on a 24 GiB
+card **between m=7 and m=8** at T=512 and dies at m=8/T=1024, while both Gramian
+engines keep running — the first direct evidence that there is a reachable size
+where materialising `[m, P]` is impossible and this approach is not. jdgram is
+exact there (**4.0e-08** against brute force), holds **0.72–0.75×** `autogram`'s
+peak untied, and — reversing the small-model result — is **the fastest and
+leanest engine in all twelve aggregator cells**, 1.45× faster than `autogram`
+and 1.5–2.0× faster than `autojac`.
+
+Two honest corrections come with it: the tied-memory advantage of §7.1
+**reverses** at this scale, and the router is *right* below `m·T² ≈ 500k` and
+wrong above it — the penalty reaching **1.79×**.
 
 ---
 
@@ -377,21 +381,20 @@ single number in the results, only how long they take to produce.
 
 ---
 
-## 8. GPT-2 124M: the scale test (v9, run in progress)
+## 8. GPT-2 124M: the scale test
 
-**Status: partial.** Run tag `v9_20260731-*` on **fuji2** (4× RTX A5000 24 GiB,
-torch 2.4.1+cu121) — a different box from the v8 numbers above, so compare
-within a version, not across. Full GPT-2 124M: 12 layers, 12 heads, 768 wide,
-V=50257, 124,439,808 trainable parameters with tying on. `router`, `headline`,
-`crossover` and part of `ladder` have completed; aggregators, accuracy and trace
-are still running. **Two caveats up front:** the gate suite did not execute on
-this box (`pytest` is not installed in that env) and `jacopt` is absent, so there
-is no QP arm. Correctness below rests on the in-run brute-force anchor instead.
+Run tag `v9_20260731-*` on **fuji2** (4x RTX A5000 24 GiB, torch 2.4.1+cu121) --
+a different box from sections 0-7, so compare ratios within a version, not
+absolute timings across. Full GPT-2 124M: 12 layers, 12 heads, 768 wide,
+V=50257, 124,439,808 trainable parameters with tying on. 20 tagged runs,
+campaign complete. **One caveat first:** the gate suite did not execute on this
+box (`pytest` absent from that env), so correctness here rests on the in-run
+brute-force anchor rather than the 44 gates.
 
-### 8.1 `autojac` stops fitting between m=7 and m=8 — the crossover, measured
+### 8.1 `autojac` stops fitting between m=7 and m=8 -- the crossover, measured
 
-This is the claim the whole project rests on, and until now nothing had been run
-at a size where it could be tested. Peak MiB, T=512, untied:
+The claim the whole approach rests on, and until now untested at a size where it
+could fail. Peak MiB, T=512, untied:
 
 | m | jdgram | `autogram` | `autojac` |
 |---|---|---|---|
@@ -402,66 +405,146 @@ at a size where it could be tested. Peak MiB, T=512, untied:
 | 9 | **7144** | 9794 | **OOM** |
 | 12 | **9313** | 12847 | **OOM** |
 
-At the headline rung (m=8, T=1024): jdgram 12206 MiB, `autogram` 14562,
-`autojac` **OOM** — it asked for 12.27 GiB more than the card had.
+At m=8, T=1024 -- the full GPT-2 context -- `autojac` asks for 12.27 GiB beyond
+the card and dies; jdgram runs in 12206 MiB and `autogram` in 14562.
 
-So there is a real, reachable size at which materialising `[m, P]` is impossible
-and both Gramian engines keep running, and jdgram sits at **0.72–0.75×**
-`autogram`'s peak throughout the untied sweep. The boundary landed exactly inside
-the m=7/m=8 bracket the campaign was designed around.
+**There is a real, reachable size at which materialising `[m, P]` is impossible
+and both Gramian engines keep running**, and jdgram holds **0.72-0.75x**
+`autogram`'s peak across the whole untied sweep.
 
-### 8.2 Correctness holds at 124M
+### 8.2 At 124M jdgram is the fastest engine, not the slowest
 
-The brute-force anchor now runs at this size (it was previously gated off by an
+The section 6 matrix had `autojac` fastest by ~1.6x, with the note that the trade
+only pays where it cannot run. At 124M that reverses completely (m=4, T=128,
+200 steps, real Shakespeare):
+
+| Aggregator | Engine | ms/step | peak MiB | val CE | val acc |
+|---|---|---|---|---|---|
+| Mean | **jdgram** | **84.4** | **1255** | 3.1739 | 0.2083 |
+| Mean | autogram | 122.5 | 2389 | 3.1739 | 0.2083 |
+| Mean | autojac | 125.4 | 4265 | 3.2426 | 0.1939 |
+| UPGrad | **jdgram** | **85.4** | **1727** | 2.8452 | 0.2589 |
+| UPGrad | autogram | 122.8 | 2861 | 2.8436 | 0.2598 |
+| UPGrad | autojac | 154.1 | 4265 | 2.8450 | 0.2590 |
+| MGDA | **jdgram** | **100.8** | **1727** | 2.8315 | 0.2579 |
+| MGDA | autogram | 139.0 | 2861 | 2.8225 | 0.2597 |
+| MGDA | autojac | 169.6 | 4265 | 2.8843 | 0.2316 |
+| PCGrad | **jdgram** | **84.4** | **1727** | 5.1042 | 0.0848 |
+| PCGrad | autogram | 122.3 | 2861 | 4.0904 | 0.0527 |
+| PCGrad | autojac | 154.1 | 4265 | 3.6217 | 0.0527 |
+| -- | sgd_erm | 38.5 | 1727 | 3.1739 | 0.2083 |
+
+**jdgram is now fastest and leanest in all twelve cells** -- 1.45x faster than
+`autogram` and 1.5-2.0x faster than `autojac`, at 0.53x and 0.29-0.40x their
+peaks. The Gramian trade begins paying at exactly the scale predicted, and this
+is the first table in this project where it does.
+
+Mean, UPGrad and MGDA agree on held-out CE across all three engines to three
+decimals. **PCGrad does not**, and it diverges: val CE 5.10 / 4.09 / 3.62 for
+jdgram / `autogram` / `autojac` against UPGrad's 2.845. Three engines computing
+the same Gramian should not produce three different PCGrad outcomes, so this is
+either PCGrad's own instability at this scale or a projection-order sensitivity;
+either way it is **unexplained and should not be quoted as a result**.
+
+### 8.3 The router: right where it matters, wrong where it does not
+
+`compute_gramian` ms per iteration, `squashed`:
+
+| config | m*T^2 | `auto` | T-first | d-first | verdict |
+|---|---|---|---|---|---|
+| m=2, T=256 | 131k | **43.4** | 43.4 | 86.3 | auto right, 2.0x |
+| m=4, T=256 | 262k | **96.5** | 96.6 | 123.7 | auto right, 1.28x |
+| m=8, T=256 | 524k | 245.1 | 245.7 | **199.3** | auto wrong, 1.23x |
+| m=4, T=512 | 1.0M | 234.3 | 244.1 | **199.0** | auto wrong, 1.18x |
+| m=8, T=512 | 2.1M | 614.2 | 745.5 | **343.5** | auto wrong, **1.79x** |
+| m=16, T=512 | 4.2M | 1071.6 | 2557.3 | **637.6** | auto wrong, **1.68x** |
+| m=8, T=1024 | 8.4M | 1104.9 | 2599.1 | **669.0** | auto wrong, **1.65x** |
+
+And the peak spread between the two routes, from the stats tool:
+
+| config | route peak spread | verdict |
+|---|---|---|
+| m=2, T=256 | 1256 vs 1516 MiB -- **17%** | router *is* controlling memory |
+| m=4, T=256 | 1935 vs 2542 -- **24%** | controlling memory |
+| m=8, T=256 | 3381 vs 4596 -- **26%** | controlling memory |
+| m=4, T=512 | 3382 vs 3419 -- **1%** | flagged: workspace is not the peak |
+| m=8, T=512 | 6274 vs 6348 -- **1%** | flagged |
+| m=16, T=512 | 12058 vs 12207 -- **1%** | flagged |
+| m=8, T=1024 | 12059 vs 12059 -- **0%** | flagged |
+
+Read together these are the whole diagnosis, and it is cleaner than the earlier
+single data point suggested:
+
+- Below `m*T^2` of roughly 500k the workspace genuinely **is** a meaningful share
+  of peak (17-26% spread) and the rule picks the faster route. **The router is
+  correct there, and switching it off would cost 2.0x at the smallest rung.**
+- Above that, the workspace difference collapses into the noise (0-1%) because
+  peak is set by forward activations and held captures, while the *time*
+  difference grows to **1.79x**.
+
+So the rule optimises a quantity that stops existing exactly as the penalty for
+optimising it starts to matter. The fix is a genuine cost model weighing both
+axes, not a blanket switch to d-first. Note also that `auto` at m=8/T=512 sits
+between the two forced routes (614 against 745 and 344) -- routing is per layer,
+so it is already choosing d-first for some layers and T-first for others.
+
+### 8.4 The tied-memory inversion does *not* hold at 124M
+
+Section 7.1 reported jdgram becoming leaner than `autogram` on tied models at
+large vocabulary. At full GPT-2 that reverses:
+
+| | untied | tied |
+|---|---|---|
+| m=4, T=512 | 0.75x | 1.54x |
+| m=8, T=512 | 0.73x | 1.03x |
+| m=12, T=512 | 0.72x | 1.03x |
+| m=8, T=1024 | 0.84x | 1.19x |
+
+Held captures scale exactly linearly in m -- 99.7 MiB at m=2, 199.3 at m=4,
+398.6 at m=8, 1594.5 at m=16 -- which is `m * V * d * 4` bytes, the cost of
+keeping both tied sites alive until the cross terms can be formed. At 124M that
+group is 38.6M parameters and the bill exceeds what `autogram` saves by omitting
+the terms it omits.
+
+**Leaner untied, heavier tied, exact in both.** The memory win and the
+correctness win do not stack at this scale, and section 7.1 should be read as a
+property of that smaller model rather than a general result.
+
+### 8.5 Correctness holds at 124M
+
+The brute-force anchor runs at this size now (it was gated off by an
 element-count guard that demanded `m < 0.32` at 124M):
 
 | | vs brute force |
 |---|---|
 | jdgram | **4.04e-08** (m=4), **5.80e-08** (m=6) |
-| `autogram`, tied | 3.88e-06 – 4.21e-06 |
+| `autogram`, tied | 3.88e-06 to 4.21e-06 |
 | `autojac` | 8.48e-05 / 5.57e-05 |
 
-Two things worth noting. jdgram is exact at full scale, not just at gate scale.
-And **`autojac` is the least accurate of the three** — three orders of magnitude
-looser than jdgram — because its vmapped fp32 reverse accumulates differently.
-That is not a defect, but it does remove "autojac is the trustworthy reference"
-as an argument.
+jdgram is exact at full scale, not only at gate scale. `autojac` is the **least**
+accurate of the three -- three orders of magnitude looser than jdgram -- because
+its vmapped fp32 reverse accumulates differently. Not a defect, but it retires
+"autojac is the trustworthy reference" as an argument.
 
-### 8.3 The router bug reproduces — and it is not one-directional
+### 8.6 Execution profile, and two things that did not work
 
-`compute_gramian` ms per iteration, `squashed`:
+At 124M the step is **GEMM-dominated rather than dispatch-bound**, the opposite
+of the small-model finding: 677 ms self-CUDA against 549 ms self-CPU over 48164
+op calls, with `ampere_sgemm_128x64_tn` the top kernel at 13% and `aten::mm`
+variants filling most of the rest. `GramianNodeBackward` is 5.2% of CPU time
+(8.6% across all three of its entries) and `cudaLaunchKernel` 9.5% over 6375
+launches. The per-layer Python loop is no longer the first thing to fix here.
 
-| config | `auto` | forced T-first | forced d-first | verdict |
-|---|---|---|---|---|
-| m=2, T=256 | 43.4 | 43.4 | 86.3 | auto **right** (T-first 2.0× faster) |
-| m=4, T=256 | 96.5 | 96.6 | 123.7 | auto **right** |
-| m=8, T=256 | 245.1 | 245.7 | **199.3** | auto **wrong**, 1.23× |
-| m=4, T=512 | 234.3 | 244.1 | **199.0** | auto **wrong**, 1.18× |
+Two negative results worth recording:
 
-This is more useful than v8's single data point, and it changes the fix. The rule
-is **correct at small `m·T²` and wrong once it grows** — so the answer is a real
-cost model, not "always take d-first". A blanket switch would have made the
-m=2/T=256 case **twice as slow**. The penalty at 124M (1.18–1.23×) is also
-milder than the 2.76× seen on the small-trunk model at V=50257, because the
-trunk's own work now dominates the head's.
-
-### 8.4 The tied-memory inversion does *not* hold at 124M
-
-§7.1 reported jdgram becoming leaner than `autogram` on tied models at large
-vocabulary. At full GPT-2 that reverses:
-
-| | untied | tied |
-|---|---|---|
-| m=4, T=512 | 0.75× | 1.54× |
-| m=8, T=512 | 0.73× | 1.03× |
-| m=8, T=1024 | 0.84× | 1.19× |
-
-Held captures reach **398.6 MiB** at m=8. At 124M the tied group is a 38.6M-parameter
-object, and holding both sites until the cross terms can be formed costs more
-than `autogram` saves by omitting them. The honest statement is therefore:
-**jdgram is leaner untied, heavier tied, and exact in both** — the memory win and
-the correctness win do not stack at this scale, and §7.1 should be read as a
-property of that smaller model rather than a general result.
+- **L7 learned nothing.** All four engines produced identical trajectories, but
+  flat ones -- 10.972 initial, 10.967 final, no movement in 200 steps. Training a
+  50257-wide head on a 65-symbol corpus at the default learning rate does not
+  learn, so L7 in this configuration confirms engine *agreement* and nothing
+  about convergence. L11 did learn (11.08 to 3.17) because it trains longer.
+- **No QP arm.** `jacopt` is not installed on fuji2, so the GPU-QP comparison has
+  not been repeated at this scale. The dual-cone solve costs 0.46-0.92 ms here,
+  under 1% of a step, so it is not currently a bottleneck.
 
 ---
 
@@ -552,22 +635,38 @@ Both recorded as checked-and-rejected.
 | Question | Answer |
 |---|---|
 | Does the CIFAR result transfer? | **No**, and the reason is `T = 1`. |
-| Where does jdgram beat TorchJD? | **Correctness on tied weights** (1.58e-07 vs 1.234e-03); **memory in every aggregator cell** (111–123 vs 186–328 MiB) and **at every vocabulary ≥ 8000** (0.84–0.90× `autogram`); **1.9× on time vs `autogram`** at V=65. |
-| Where does it lose? | `autojac` is ~1.6× faster at this scale. **Time at V ≥ 32000 (2.5–2.7× `autogram`) — caused entirely by the router.** GPU idle 48–51%, dispatch-bound. |
-| Is the QP a bottleneck? | No — 2.7% of a step at m=8. Matters above m ≈ 64. |
-| Is the router working? | **For memory at small V, yes** (34–56% spread). **At vocabulary scale, no** — it costs 2.76× in time for a saving that is invisible at model scale. |
+| Is there a size where `autojac` cannot run and this can? | **Yes, and it is now measured** — between m=7 and m=8 at GPT-2 124M, T=512 (§8.1). This is the claim the approach rests on and it was untested until v9. |
+| Where does jdgram beat TorchJD? | **Correctness on tied weights** at every scale (4.0e-08 vs 3.9e-06 at 124M). **Memory untied**, 0.72–0.75× `autogram` throughout. **Speed and memory in all twelve aggregator cells at 124M** — 1.45× faster than `autogram`, 1.5–2.0× faster than `autojac`, at 0.53× and 0.29–0.40× their peaks. |
+| Where does it lose? | **Tied memory at 124M** (1.03–1.54× `autogram`) — the held-capture bill exceeds what `autogram` saves by being wrong. **Time at large `m·T²`**, entirely the router. At small scale `autojac` is still ~1.6× faster. |
+| Is the QP a bottleneck? | No — under 1% of a step at 124M (0.46–0.92 ms). Matters above m ≈ 64. |
+| Is the router working? | **Below `m·T² ≈ 500k`, yes** — it controls 17–26% of peak *and* picks the faster route. **Above it, no** — the memory difference vanishes (0–1%) while the time penalty grows to 1.79×. |
 
 ## 11. Open items, ranked
 
-1. **Fix the router cost model.** Select on `min(time, memory)`, not memory alone.
-   Worth **2.76×** at V=50257 and turns a 2.67× time loss into parity. Cheapest
-   high-value change available.
-2. **Dispatch-bound execution.** GPU idle 48–51%, 48% of 1257 launches under 8 µs,
-   `GramianNodeBackward` 5.6% of CPU time. Batch or fuse the per-layer loop.
-3. **LoRA registration and gate.** Identity unchanged; registration only.
-4. **Qwen-scale validation.** Nothing here has run above 16.03M parameters.
-5. **Multi-call modules.** The engine raises `NotImplementedError` for a module
+1. **Fix the router cost model.** Worth **1.79×** at 124M, m=8/T=512, and the
+   penalty is now bounded on both sides: the rule must keep choosing T-first
+   below `m·T² ≈ 500k`, where it is worth 2.0×, and stop choosing it above.
+   A rule that weighs measured per-route time against workspace *as a share of
+   peak* is the shape; the coefficients are hardware-dependent and have to be
+   measured on the target card. Both routes are numerically identical, so this
+   can only change how long a run takes.
+2. **The tied-capture bill.** Held captures are `m·V·d·4` bytes — 1.6 GiB at
+   m=16 — and are what makes jdgram heavier than `autogram` on tied models at
+   124M. Chunking the tied cross-term over the vocabulary would trade time for
+   this, and would turn the one remaining memory loss into a win.
+3. **PCGrad disagrees across engines at 124M** (val CE 5.10 / 4.09 / 3.62 for
+   jdgram / `autogram` / `autojac`) while Mean, UPGrad and MGDA agree to three
+   decimals. Unexplained. Either PCGrad instability at this scale or an
+   ordering sensitivity; it needs isolating before any PCGrad number is quoted.
+4. **Qwen-scale validation.** 124M is measured; Qwen-1.7B is 14× beyond it and
+   remains arithmetic.
+5. **LoRA registration and gate.** Identity unchanged; registration only.
+6. **Multi-call modules.** The engine raises `NotImplementedError` for a module
    called more than once per forward; TorchJD's streaming counter is the model.
+
+Dispatch-boundedness has dropped off this list: at 124M the step is
+GEMM-dominated (§8.6), so the per-layer Python loop is no longer the first thing
+to fix. It remains the right target at small model sizes.
 
 ## Appendix — reproduction
 
