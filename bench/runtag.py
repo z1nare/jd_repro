@@ -183,7 +183,13 @@ class RunContext:
             "config": config or {},
         }
         p = self.path("manifest.json")
-        p.write_text(json.dumps(man, indent=2))
+        # default=str so one un-serializable value in the config -- a Path, an
+        # enum, a dtype -- degrades to its string form instead of killing the
+        # run. This is written before any work happens, so a manifest that
+        # raises destroys the whole invocation for a provenance record nobody
+        # would have minded being approximate. A `--cost-model` declared as
+        # argparse type=Path did exactly that to a full verification sweep.
+        p.write_text(json.dumps(man, indent=2, default=str))
         return p
 
     def finalize(self, status: str = "ok", summary: dict | None = None) -> None:

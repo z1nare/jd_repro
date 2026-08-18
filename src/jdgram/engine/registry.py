@@ -117,8 +117,9 @@ def linear_handler(module: nn.Linear, A: torch.Tensor, X: torch.Tensor) -> torch
     from jdgram.engine.router import route
 
     m, T, _ = A.shape
-    P_layer = module.out_features * module.in_features
-    if route(m, T, P_layer) == "dfirst":
+    d_out, d_in = module.out_features, module.in_features
+    P_layer = d_out * d_in
+    if route(m, T, P_layer, d_out, d_in) == "dfirst":
         return materialized_gramian(A, X, module.bias is not None)
     return linear_id.sequence_gramian(A, X, module.bias is not None)
 
@@ -143,20 +144,68 @@ def positional_embedding_handler(
     return embedding_id.positional_embedding_gramian(A)
 
 
-@register(nn.LayerNorm)
-def layernorm_handler(module: nn.Module, A: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
-    eps = getattr(module, "eps", 1e-5)
-    return norm_id.norm_gramian(A, X, getattr(module, "bias", None) is not None, eps=eps)
+def _norm_eps(module: nn.Module, *, default: float | None) -> float:
+    """Read a norm module's epsilon, whatever the author decided to call it.
+
+    ``nn.LayerNorm`` and ``Qwen3_5RMSNorm`` store ``eps``; ``Qwen3RMSNorm`` and
+    ``Qwen3_5RMSNormGated`` store ``variance_epsilon`` -- the two conventions
+    coexist inside a single HuggingFace model file. ``torch.nn.RMSNorm`` stores
+    ``eps = None`` unless one is passed, so a plain ``getattr`` is not enough.
+
+    ``default`` is a float only where the value is genuinely known from the
+    module's source (nanoGPT hardcodes 1e-5 in ``forward`` and exposes nothing);
+    it is ``None`` for RMSNorm, where guessing 1e-5 against a config that says
+    1e-6 is exactly the silent-wrong-number failure this exists to prevent.
+    """
+    for attr in ("eps", "variance_epsilon"):
+        value = getattr(module, attr, None)
+        if value is not None:
+            return float(value)
+    if default is not None:
+        return default
+    raise ValueError(
+        f"{type(module).__name__} exposes neither .eps nor .variance_epsilon. Refusing to "
+        f"assume one: the Gramian is wrong by the ratio of the true and assumed epsilon, "
+        f"silently. Pass the module through handler_overrides with an explicit eps."
+    )
 
 
-def _is_norm_like(module: nn.Module) -> bool:
+def _norm_handler(center: bool, *, eps_default: float | None):
+    def handler(module: nn.Module, A: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+        return norm_id.norm_gramian(
+            A, X, getattr(module, "bias", None) is not None,
+            eps=_norm_eps(module, default=eps_default), center=center,
+        )
+
+    return handler
+
+
+# center=True subtracts the mean, center=False does not. Dispatching both
+# families to one handler silently hands RMSNorm the LayerNorm xhat, and since
+# xhat *is* d(output)/d(gamma), every per-objective gradient is then wrong --
+# symmetric, PSD and correctly shaped, so nothing downstream can catch it.
+layernorm_handler = _norm_handler(center=True, eps_default=1e-5)
+rmsnorm_handler = _norm_handler(center=False, eps_default=None)
+
+register(nn.LayerNorm)(layernorm_handler)
+if hasattr(nn, "RMSNorm"):  # torch >= 2.4; its MRO is (RMSNorm, Module) so the
+    register(nn.RMSNorm)(rmsnorm_handler)  # MRO walk below would never find it
+
+
+def _is_norm_like(module: nn.Module, suffix: str) -> bool:
     """Match custom LayerNorm/RMSNorm classes that subclass nn.Module directly.
 
     Deliberately narrow: a 1-D ``weight``, an optional 1-D ``bias``, no other
     direct parameters, and a class name that says what it is. Anything broader
     would start silently claiming modules whose identity is not II.5.
+
+    In particular this must NOT be widened to match ``*RMSNormGated``. A gated
+    norm computes ``w * xhat * silu(gate)``, so d(out)/d(w) carries the gate
+    factor -- and the forward hook only captures ``args[0]``, so the gate is not
+    even available. Those classes currently raise KeyError from ``dispatch``,
+    which is the correct outcome; matching them would produce a wrong number.
     """
-    if not type(module).__name__.endswith(("LayerNorm", "RMSNorm")):
+    if not type(module).__name__.endswith(suffix):
         return False
     direct = dict(module.named_parameters(recurse=False))
     weight = direct.pop("weight", None)
@@ -166,7 +215,10 @@ def _is_norm_like(module: nn.Module) -> bool:
     return bias is None or bias.ndim == 1
 
 
-register_predicate(_is_norm_like)(layernorm_handler)
+# Two predicates, not one tuple: the suffixes are disjoint, and keeping them
+# separate is what makes the center= choice follow from the class name.
+register_predicate(lambda m: _is_norm_like(m, "RMSNorm"))(rmsnorm_handler)
+register_predicate(lambda m: _is_norm_like(m, "LayerNorm"))(layernorm_handler)
 
 
 def check_module_supported(name: str, module: nn.Module) -> None:

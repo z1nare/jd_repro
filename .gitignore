@@ -37,5 +37,13 @@ profiler_trace.json.gz
 *.zip
 *.log
 
-# Personal meeting notes, not a repository artifact.
+# Campaign output. Every run directory is reproducible from the script plus the
+# manifest it writes, and a full campaign is thousands of files -- one v10 sweep
+# alone left 81 untracked paths and ~2.9 MB. Leaving this un-ignored meant a
+# reflexive `git add -A` would commit the entire results tree along with the code
+# change it was meant to capture. Transfer results with the bundle stage instead.
+results/
+
+# Personal records, not repository artifacts.
 MEETING_DELIVERY.md
+internship-evidence-*.md

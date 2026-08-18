@@ -124,7 +124,7 @@ def tied_gramian(
 
     m, T, d = X_head.shape
     V = A_head.shape[-1]
-    head_route = pick_route(m, T, V * d)
+    head_route = pick_route(m, T, V * d, V, d)
     if cross_route is None:
         cross_route = head_route
 

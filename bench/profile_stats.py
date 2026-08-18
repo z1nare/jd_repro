@@ -406,6 +406,96 @@ def analyse_trace(path: Path, rep: Report, top: int) -> None:
     memset = by_cat.get("gpu_memset", [])
     runtime = by_cat.get("cuda_runtime", [])
 
+    # ---- launch geometry and occupancy ----
+    # Every kernel event carries an "args" dict with grid, block, registers per
+    # thread, shared memory and the profiler's occupancy estimate. This was
+    # parsed for cat/name/ts/dur only and args was dropped, so the one piece of
+    # hardware-level evidence already on disk in every --trace-raw run was being
+    # thrown away and then described as "not available without ncu".
+    # The occupancy key is spelled differently across torch versions -- 2.10
+    # emits "est. achieved occupancy %" (0-100), older builds emit
+    # "est. achieved occupancy" (0-1). Accept both and normalise to a fraction,
+    # because this analysis has to read traces produced on the cluster (2.4.1)
+    # and on a laptop (2.10) and silently reporting None on one of them is how
+    # the whole section came to be believed unavailable in the first place.
+    OCC_KEYS = ("est. achieved occupancy %", "est. achieved occupancy",
+                "est_achieved_occupancy")
+
+    def _occupancy(a):
+        for key in OCC_KEYS:
+            if key in a:
+                try:
+                    v = float(a[key])
+                except (TypeError, ValueError):
+                    return None
+                return v / 100.0 if v > 1.5 else v
+        return None
+
+    geom: dict[str, dict] = {}
+    for k in kernels:
+        a = k.get("args") or {}
+        if not a:
+            continue
+        name = k.get("name", "?")
+        g = geom.setdefault(name, {"launches": 0, "occ": [], "regs": None,
+                                   "smem": None, "grid": None, "block": None,
+                                   "bpsm": None, "wpsm": None})
+        g["launches"] += 1
+        occ = _occupancy(a)
+        if occ is not None:
+            g["occ"].append(occ)
+        for src, dst in (("registers per thread", "regs"),
+                         ("shared memory", "smem"),
+                         ("grid", "grid"), ("block", "block"),
+                         ("blocks per SM", "bpsm"), ("warps per SM", "wpsm")):
+            if g[dst] is None and a.get(src) is not None:
+                g[dst] = a[src]
+
+    if geom:
+        # One pass for durations; the per-name generator inside the loop was
+        # O(kernels^2) and a real trace carries tens of thousands of events.
+        dur_by_name: dict[str, float] = defaultdict(float)
+        for k in kernels:
+            dur_by_name[k.get("name", "?")] += float(k.get("dur", 0.0))
+        rows = []
+        for name, g in geom.items():
+            occs = g["occ"]
+            rows.append({
+                "kernel": name[:110],
+                "launches": g["launches"],
+                "device_ms": round(dur_by_name[name] * US * 1e3, 3),
+                "mean_occupancy": round(sum(occs) / len(occs), 4) if occs else None,
+                "registers_per_thread": g["regs"],
+                "shared_memory": g["smem"],
+                "blocks_per_sm": g["bpsm"],
+                "warps_per_sm": g["wpsm"],
+                "grid": g["grid"],
+                "block": g["block"],
+            })
+        rows.sort(key=lambda r: -r["device_ms"])
+        rep.sections["kernel_launch_geometry"] = rows[:top]
+
+        # An occupancy floor only matters on a kernel that holds real time.
+        # 0.3 is the conventional bar below which a kernel is usually limited by
+        # registers or block shape rather than by arithmetic.
+        busy = sum(r["device_ms"] for r in rows) or 1.0
+        low = [r for r in rows
+               if r["mean_occupancy"] is not None
+               and r["mean_occupancy"] < 0.3
+               and r["device_ms"] / busy > 0.05]
+        if low:
+            worst = low[0]
+            rep.add(
+                "medium", "occupancy",
+                f"{len(low)} kernel(s) holding >5% of device time run below 0.3 "
+                f"occupancy; worst is {worst['mean_occupancy']:.2f} on "
+                f"{worst['kernel'][:60]} ({worst['device_ms']:.1f} ms). Low "
+                f"occupancy on a hot kernel points at block shape or register "
+                f"pressure, not at the arithmetic.",
+                "; ".join(f"{r['kernel'][:40]}={r['mean_occupancy']:.2f}"
+                          for r in low[:6]),
+            )
+
     # ---- per-kernel distribution ----
     kstats: dict[str, list[float]] = defaultdict(list)
     for k in kernels:
@@ -610,13 +700,14 @@ def render(rep: Report, top: int) -> str:
     table("top ops by self CPU time", s.get("top_ops_self_cpu", []))
     table("most frequent CPU ops (dispatch pressure)", s.get("most_frequent_cpu_ops", []))
     block("launch-boundedness", s.get("launch_bound"))
+    block("kernel launch geometry / occupancy", s.get("kernel_launch_geometry"))
     table("sync-forcing ops (GPU exits to host)", s.get("sync_forcing_ops", []))
     table("blocking CUDA runtime calls", s.get("runtime_sync_calls", []))
     block("device-to-host copies", s.get("device_to_host_copies"))
     table("top ops by CUDA allocation", s.get("top_ops_by_cuda_alloc", []))
     table("live allocation sites", s.get("live_allocation_sites", []))
     block("driver peak (max MiB)", s.get("driver_peak_max_mib"))
-    block("route peak spread", s.get("route_peak_spread"))
+    block("route peak spread", s.get("route_peak_spread_by_driver"))
     block("scaling exponents", s.get("scaling_exponents"))
     table("identity peak vs theoretical workspace",
           s.get("identity_overhead_vs_theory", []))
@@ -687,7 +778,7 @@ def analyse_run(run_dir: Path, top: int) -> Report:
 def compare(reports: list[Report]) -> str:
     """Before/after on the quantities that decide whether a fix worked."""
     out = ["\n" + "=" * 78, "COMPARISON", "=" * 78]
-    keys = ["driver_peak_max_mib", "route_peak_spread", "scaling_exponents",
+    keys = ["driver_peak_max_mib", "route_peak_spread_by_driver", "scaling_exponents",
             "gpu_utilisation", "kernel_totals", "op_totals",
             "cuda_concentration_top5_pct", "live_allocation_total_mib"]
     for k in keys:

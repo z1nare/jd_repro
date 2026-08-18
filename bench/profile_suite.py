@@ -149,6 +149,11 @@ class Row:
     P_layer: int = -1
     P_total: int = -1
     tie: str = ""
+    # How the m objectives relate to each other. Empty for levels that do not
+    # vary it. Must also appear in RunLogger.KEY: a field in Row but not in KEY
+    # makes two genuinely different cells collide on resume, and the second is
+    # silently skipped rather than reported missing.
+    objective_mode: str = ""
     metric: str = ""
     value: float = float("nan")
     unit: str = ""
@@ -174,7 +179,7 @@ class RunLogger:
     # skipped as "already done".
     KEY = ("level", "test", "engine", "driver", "route", "dtype", "tie",
            "m", "T", "V", "n_embd", "n_layer", "n_head", "d_in", "d_out",
-           "P_layer", "P_total", "metric")
+           "P_layer", "P_total", "objective_mode", "metric")
 
     def __init__(self, path: Path, resume: bool = True) -> None:
         self.path = path
@@ -459,10 +464,17 @@ def brute_force_gramian(model, idx, tgt) -> torch.Tensor:
 
 
 def jdgram_gramian(model, modules, overrides, shared, idx, tgt, *, driver=None,
-                   force_route=None, wdtype=None):
+                   force_route=None, wdtype=None, losses_fn=None):
+    # losses_fn lets a caller supply the exact loss vector the other engines are
+    # given. Without it this builds its own from (idx, tgt), which is fine while
+    # every objective is an unweighted per-sequence loss -- but the moment a
+    # caller scales or negates objectives (see apply_objective_mode) jdgram would
+    # silently Gram the *unscaled* losses while autogram and autojac Gram the
+    # scaled ones, and the engines would disagree for a reason that looks like an
+    # engine bug and is not.
     return compute_gramian(
         model,
-        lambda: per_sequence_losses(forward_logits(model, idx), tgt),
+        losses_fn or (lambda: per_sequence_losses(forward_logits(model, idx), tgt)),
         modules=modules,
         handler_overrides=overrides,
         shared_handlers=shared,
@@ -808,7 +820,8 @@ def level3_accumulate(rc, dev, log: RunLogger, viol: Violations, dtype_name: str
 # ================================================ L4: full step, phase by phase
 def level4_phases(rc, dev, log: RunLogger, viol: Violations, dtype_name: str,
                   m=8, T=512, V=65, n_embd=256, n_layer=4, tie=True,
-                  driver=None, force_route=None, reps=10) -> None:
+                  driver=None, force_route=None, reps=10,
+                  objective_mode="independent") -> None:
     """One complete jdgram optimiser step, decomposed. A transient phase that
     retains memory after a sync is where state is being held."""
     label = f"{driver or 'default'}/{force_route or 'auto'}"
@@ -821,7 +834,8 @@ def level4_phases(rc, dev, log: RunLogger, viol: Violations, dtype_name: str,
     wd = torch.float32 if dtype_name == "fp32" else torch.float64
     base = dict(level="L4", engine="jdgram", driver=driver or "default",
                 route=force_route or "auto", dtype=dtype_name, m=m, T=T, V=V,
-                n_embd=n_embd, n_layer=n_layer, tie=str(tie))
+                n_embd=n_embd, n_layer=n_layer, tie=str(tie),
+                objective_mode=objective_mode)
 
     clear(dev)
     tr = PhaseTracker(dev)
@@ -829,14 +843,28 @@ def level4_phases(rc, dev, log: RunLogger, viol: Violations, dtype_name: str,
         model, modules, ov, sh = build_model(dev, n_embd=n_embd, T=T, V=V,
                                              n_layer=n_layer, tie=tie)
     idx, tgt = synthetic_batch(m, T, V, dev)
+    # Random tokens are fine here: this level measures cost, and cost does not
+    # depend on what the tokens say.
+    #
+    # The objective mode still matters, because the weighting_qp phase below
+    # solves on the REAL Gramian produced by the preceding compute_gramian --
+    # so under a conflicting mode the dual-cone solve actually projects instead
+    # of short-circuiting on an all-non-negative Gramian. Measured at m=4: 0.92
+    # ms agreeing vs 0.72 ms conflicting, i.e. no penalty and within noise of
+    # each other. That is worth having on record, because "the QP gets expensive
+    # once objectives really conflict" is a plausible worry that turns out to be
+    # false, and this is the phase that can say so.
+    idx, tgt, _coeffs = apply_objective_mode(idx, tgt, objective_mode, dev)
     opt = torch.optim.SGD(model.parameters(), lr=0.01)
 
     def losses_fn():
-        return per_sequence_losses(forward_logits(model, idx), tgt)
+        ls = per_sequence_losses(forward_logits(model, idx), tgt)
+        return ls * _coeffs.to(ls.dtype)
 
     with contextlib.suppress(Exception):  # allocator warmup only
         jdgram_gramian(model, modules, ov, sh, idx, tgt, driver=driver,
-                       force_route=force_route, wdtype=wd)
+                       force_route=force_route, wdtype=wd,
+                       losses_fn=losses_fn)
     clear(dev)
 
     # Every phase is timed over `reps` iterations after a warmup pass. Measuring
@@ -849,7 +877,8 @@ def level4_phases(rc, dev, log: RunLogger, viol: Violations, dtype_name: str,
     try:
         with oom_guard(dev, "L4/warmup"):
             _r = jdgram_gramian(model, modules, ov, sh, idx, tgt, driver=driver,
-                                force_route=force_route, wdtype=wd)
+                                force_route=force_route, wdtype=wd,
+                                losses_fn=losses_fn)
             _w = weighting(_r.total.to(torch.float32))
             _l = losses_fn()
             _l.backward(_w.to(_l.dtype))
@@ -867,7 +896,7 @@ def level4_phases(rc, dev, log: RunLogger, viol: Violations, dtype_name: str,
                 for _ in range(reps):
                     result = jdgram_gramian(model, modules, ov, sh, idx, tgt,
                                             driver=driver, force_route=force_route,
-                                            wdtype=wd)
+                                            wdtype=wd, losses_fn=losses_fn)
         G = result.total
         G32 = G.to(torch.float32)
         with tr.phase("weighting_qp", f"x{reps}, UPGrad dual-cone solve on [m,m]"):
@@ -878,6 +907,19 @@ def level4_phases(rc, dev, log: RunLogger, viol: Violations, dtype_name: str,
                 losses2 = losses_fn()
                 losses2.backward(w.to(losses2.dtype))
                 opt.zero_grad(set_to_none=True)
+        # The loop above ends on set_to_none, so every ``p.grad`` is None here --
+        # and ``SGD.step`` skips a parameter whose grad is None, so timing it in
+        # that state measures an empty walk over the param list, not an optimiser.
+        # Measured on GPT-2 124M (148 tensors, 473 MiB of parameters): 0.018 ms
+        # with the grads cleared against 2.85 ms with them present. The cleared
+        # reading is what every campaign so far recorded, which understates the
+        # L4 baseline -- and bench/acceptance.py builds `base = final_backward +
+        # optimizer_step`, so it propagates into every floor and fusion ratio.
+        # Restore a real gradient first; one extra unmeasured backward is cheap
+        # next to reporting the optimiser as free.
+        losses3 = losses_fn()
+        losses3.backward(w.to(losses3.dtype))
+        del losses3
         with tr.phase("optimizer_step", f"x{reps}"):
             for _ in range(reps):
                 opt.step()
@@ -1162,7 +1204,15 @@ def level7_accuracy(rc, dev, log: RunLogger, viol: Violations, dtype_name: str,
                     m=8, T=128, V=65, n_embd=256, n_layer=4, steps=100,
                     lr=0.01) -> None:
     """Does the engine still train? Loss curves for jdgram-UPGrad against
-    autogram-UPGrad, autojac-UPGrad and plain SGD, on identical data and seeds."""
+    autogram-UPGrad, autojac-UPGrad and plain SGD, on identical data and seeds.
+
+    Needs real next-token structure, not `synthetic_batch`: that draws idx and
+    tgt independently, so there is zero mutual information between input and
+    target and cross-entropy is stuck at ln(V) regardless of steps or lr -- at
+    V=50257 that is 10.82 nats, which is exactly the flat 10.972->10.967 seen at
+    124M. `_batch_from` (shared with L11) falls back to synthetic_batch itself
+    when no corpus is prepared, so this only changes behaviour once real data
+    exists."""
     print("\n" + "=" * 78)
     print(f"L7 -- convergence (m={m} T={T} steps={steps})")
     print("=" * 78)
@@ -1170,6 +1220,13 @@ def level7_accuracy(rc, dev, log: RunLogger, viol: Violations, dtype_name: str,
         print("  SKIPPED:", IMPORT_ERRORS)
         return
     wd = torch.float32 if dtype_name == "fp32" else torch.float64
+    train_tokens = _shakespeare(dev, "train")
+    data_tag = "shakespeare" if train_tokens is not None else "synthetic"
+    print(f"  data: {data_tag}"
+          + ("" if train_tokens is not None
+             else "  (run bench/prepare_shakespeare_char.py for real convergence)"))
+    log.log(Row(level="L7", test="env", metric="real_data",
+                value=float(train_tokens is not None), unit="bool", note=data_tag))
 
     for engine in ("jdgram", "autogram", "autojac", "sgd_erm"):
         base = dict(level="L7", test="convergence", engine=engine, dtype=dtype_name,
@@ -1192,7 +1249,7 @@ def level7_accuracy(rc, dev, log: RunLogger, viol: Violations, dtype_name: str,
         try:
             with oom_guard(dev, f"L7/{engine}"):
                 for step in range(steps):
-                    idx, tgt = synthetic_batch(m, T, V, dev, seed=1000 + step)
+                    idx, tgt = _batch_from(train_tokens, m, T, V, dev, seed=1000 + step)
 
                     def losses_fn():
                         return per_sequence_losses(forward_logits(model, idx), tgt)
@@ -1282,6 +1339,91 @@ def _batch_from(tokens, m, T, V, dev, seed):
     return x, y
 
 
+OBJECTIVE_MODES = ("independent", "duplicate", "scaled", "conflicting")
+
+
+def apply_objective_mode(idx, tgt, mode, dev):
+    """Reshape a batch so the m objectives stand in a known relationship.
+
+    Returns ``(idx, tgt, coeffs)``; multiply the per-objective loss vector by
+    ``coeffs`` before handing it to any engine.
+
+    Rui asked for "a pair of conflicting objectives or pair of like the same
+    correlated updates" as a sanity ladder to climb before trusting anything
+    measured on independent objectives.  ``_batch_from`` draws m independent
+    corpus windows, so that ladder did not exist.
+
+    The relationships, and what each one forces on the Gramian ``G = J Jt``:
+
+    ``independent``  m independent windows.  No structure is forced; this is
+                     the shipped behaviour and the default.
+    ``duplicate``    row 0 repeated m times, unit coefficients.  Every row of
+                     J is the same gradient g, so ``G = ||g||^2 * ones(m, m)``
+                     -- rank 1, every entry equal.  This is the strongest
+                     structural check available: no plausible engine bug
+                     (dropped cross-term, mis-indexed objective, double-counted
+                     layer) preserves rank-1-ness by accident.
+    ``scaled``       row 0 repeated, coefficients ``1, 1.1, 1.2, ...``.  Still
+                     rank 1, but now ``G[i][j] = c_i c_j ||g||^2``, which also
+                     checks that the objective axis carries scale correctly.
+    ``conflicting``  row 0 repeated, coefficients alternating ``+1, -1``.  Then
+                     ``g_2 = -g_1`` and the off-diagonal is strictly negative.
+
+    On ``conflicting``: negating an objective means maximising that loss, so a
+    long training run under this mode diverges *by construction*.  That is not
+    a failure -- the mode exists to exercise the conflict path (the QP actually
+    has to project) and to make the negative off-diagonal measurable.  Read its
+    cost and its Gramian structure; do not read its loss curve as quality.
+
+    Conflict from random data is not a substitute: two cross-entropy objectives
+    on independent windows are usually positively correlated, so a test built
+    that way passes for the wrong reason and fails intermittently.
+    """
+    if mode not in OBJECTIVE_MODES:
+        raise ValueError(f"unknown objective mode {mode!r}; expected one of {OBJECTIVE_MODES}")
+    m = idx.shape[0]
+    if mode == "independent":
+        return idx, tgt, torch.ones(m, device=dev)
+    # Slice 0:1 rather than index 0 -- indexing drops the batch dimension, and
+    # the squashed driver requires every hooked module batched on dim 0.
+    idx = idx[0:1].repeat(m, *([1] * (idx.ndim - 1)))
+    tgt = tgt[0:1].repeat(m, *([1] * (tgt.ndim - 1)))
+    if mode == "duplicate":
+        coeffs = torch.ones(m, device=dev)
+    elif mode == "scaled":
+        coeffs = torch.tensor([1.0 + 0.1 * i for i in range(m)], device=dev)
+    else:  # conflicting
+        coeffs = torch.tensor([1.0 if i % 2 == 0 else -1.0 for i in range(m)],
+                              device=dev)
+    return idx, tgt, coeffs
+
+
+def gramian_conflict_stats(G):
+    """Summarise how much a Gramian's objectives actually disagree.
+
+    Returns ``(mean_offdiag_cosine, min_offdiag_cosine, offdiag_mass)``.
+
+    The campaign labels runs "conflicting" or "correlated" by construction, but
+    nothing measured whether the objectives conflicted -- so a mode that silently
+    failed to produce conflict would read as a completed cell.  Normalising by
+    the diagonal makes this comparable across configurations:
+    ``cos_ij = G_ij / sqrt(G_ii G_jj)`` is the cosine between per-objective
+    gradients.  ``min`` near -1 is genuine opposition; near +1 is duplication.
+    """
+    import math as _math
+    m = G.shape[0]
+    if m < 2:
+        return float("nan"), float("nan"), float("nan")
+    d = G.diagonal().clamp_min(1e-30).sqrt()
+    cos = (G / d.unsqueeze(0) / d.unsqueeze(1)).double()
+    off = ~torch.eye(m, dtype=torch.bool, device=G.device)
+    vals = cos[off]
+    diag_mean = float(G.diagonal().double().mean())
+    offdiag_mass = (float(G[off].abs().double().mean()) / diag_mean
+                    if diag_mean > 0 else _math.nan)
+    return float(vals.mean()), float(vals.min()), offdiag_mass
+
+
 @torch.no_grad()
 def _evaluate(model, tokens, m, T, V, dev, batches=20, seed=999):
     """Held-out cross-entropy and next-token accuracy."""
@@ -1300,7 +1442,8 @@ def _evaluate(model, tokens, m, T, V, dev, batches=20, seed=999):
 
 def level11_aggregators(rc, dev, log: RunLogger, viol: Violations, dtype_name: str,
                         m=8, T=128, V=65, n_embd=256, n_layer=4, steps=200,
-                        lr=0.01, eval_batches=20, use_jacopt=None) -> None:
+                        lr=0.01, eval_batches=20, use_jacopt=None,
+                        force_route=None, objective_mode="independent") -> None:
     """Every aggregator against every engine, on identical data and seeds.
 
     The comparison that matters is not "is jdgram fast" but "for the aggregator you
@@ -1351,10 +1494,45 @@ def level11_aggregators(rc, dev, log: RunLogger, viol: Violations, dtype_name: s
     cells.append(("none", "", "", "sgd_erm", "default"))
     print(f"  {len(cells)} cells\n")
 
+    # KNOWN LIMITATION, investigated but not fully root-caused: peak_mib is not
+    # comparable ACROSS AGGREGATORS within one call to this function. Mean
+    # (first in AGGREGATORS, and the only one whose forward() is a pure
+    # elementwise fill) reads systematically lower than UPGrad/MGDA/PCGrad,
+    # which land on the exact same peak as each other despite having
+    # unrelated internal implementations (a QP projector, an iterative
+    # Frank-Wolfe solve, a CPU randperm) -- the signature of a shared
+    # process-level floor rather than a real per-aggregator cost. Ruled out:
+    # accumulation over steps (already fully present at steps=3); "first call
+    # to a given aggregator class" (an explicit per-aggregator warm-up, run
+    # for real before the measured loop, left the gap fully intact). Two fix
+    # attempts did not close it and were reverted rather than shipped for
+    # show.
+    #
+    # It does not corrupt anything currently computed from this data.
+    # Every ratio in this project pairs jdgram+UPGrad against sgd_erm, and at
+    # 124M (m=1, T=512) those two land on the IDENTICAL peak -- 1730.3 MiB,
+    # both -- so whatever this artifact is, numerator and denominator share it
+    # and it cancels in the ratio. Only a comparison that uses Mean's OWN
+    # peak_mib, or that reads Mean's row as if it meant "this aggregator needs
+    # less memory", would be misled. bench/acceptance.py never uses Mean.
+    #
+    # If a future analysis needs Mean's absolute number to be trustworthy, the
+    # only fix verified to be airtight (and not attempted here, since it
+    # multiplies per-cell process-startup overhead by 13x, which is the exact
+    # cost the campaign's --isolate guidance exists to avoid) is running each
+    # cell in its own subprocess.
+
+    # Per-objective loss trajectories go to a JSON sidecar rather than rows.csv:
+    # the long-format Row schema would need steps x m rows per cell, and the
+    # scalar `curve` below already occupies that budget. Two objectives that are
+    # supposed to track each other cannot be checked from a mean.
+    per_obj_records: list[dict] = []
+
     for agg_name, agg_cls, weight_cls, engine, qp_name in cells:
         base = dict(level="L11", test="train", engine=engine, driver=agg_name,
                     route=qp_name, dtype=dtype_name, m=m, T=T, V=V,
-                    n_embd=n_embd, n_layer=n_layer)
+                    n_embd=n_embd, n_layer=n_layer,
+                    objective_mode=objective_mode)
         if log.done(Row(**base, metric="final_train_loss")):
             continue
 
@@ -1364,6 +1542,8 @@ def level11_aggregators(rc, dev, log: RunLogger, viol: Violations, dtype_name: s
                                              n_layer=n_layer, seed=42)
         opt = torch.optim.SGD(model.parameters(), lr=lr)
         curve: list[float] = []
+        curve_obj: list[list[float]] = []
+        conflict_stats = None
         try:
             weighting = None
             aggregator = None
@@ -1382,24 +1562,35 @@ def level11_aggregators(rc, dev, log: RunLogger, viol: Violations, dtype_name: s
             with oom_guard(dev, f"L11/{agg_name}/{engine}/{qp_name}"):
                 # warm up before any timing so lazy init is not charged to step 0
                 idx, tgt = _batch_from(train_tokens, m, T, V, dev, 0)
+                idx, tgt, _ = apply_objective_mode(idx, tgt, objective_mode, dev)
                 sync(dev)
                 clear(dev)
                 t0 = time.perf_counter()
                 for step in range(steps):
                     idx, tgt = _batch_from(train_tokens, m, T, V, dev, 1000 + step)
+                    idx, tgt, coeffs = apply_objective_mode(
+                        idx, tgt, objective_mode, dev)
 
-                    def losses_fn():
-                        return per_sequence_losses(forward_logits(model, idx), tgt)
+                    def losses_fn(coeffs=coeffs):
+                        # coeffs bound as a default argument, not captured: the
+                        # closure outlives the loop body and a late-binding
+                        # capture would silently apply the last step's
+                        # coefficients to every engine's recomputed forward.
+                        ls = per_sequence_losses(forward_logits(model, idx), tgt)
+                        return ls * coeffs.to(ls.dtype)
 
                     if engine == "sgd_erm":
-                        loss = losses_fn().mean()
+                        ls = losses_fn()
+                        loss = ls.mean()
                         loss.backward()
                         curve.append(float(loss.detach()))
+                        curve_obj.append(ls.detach().tolist())
                     elif engine == "autojac":
                         ls = losses_fn()
                         autojac_backward(ls)
                         jac_to_grad(params, aggregator)
                         curve.append(float(ls.mean().detach()))
+                        curve_obj.append(ls.detach().tolist())
                     elif engine == "autogram":
                         # ONE forward, reused for the weighted backward. autogram's
                         # per-module remaining_counter is incremented by every
@@ -1412,6 +1603,7 @@ def level11_aggregators(rc, dev, log: RunLogger, viol: Violations, dtype_name: s
                         w = weighting(G.to(torch.float32))
                         ls.backward(w.to(ls.dtype))
                         curve.append(float(ls.mean().detach()))
+                        curve_obj.append(ls.detach().tolist())
                     else:
                         # jdgram runs its own forward inside compute_gramian and
                         # frees that graph as the reverse sweeps (which is where a
@@ -1419,12 +1611,23 @@ def level11_aggregators(rc, dev, log: RunLogger, viol: Violations, dtype_name: s
                         # backward needs a fresh one. That second forward is a real
                         # cost of the design, not a harness artifact -- it is the
                         # price of not retaining activations.
+                        #
+                        # force_route matters here even though this level is not
+                        # about routes: m*T^2 is the router's input, so along a
+                        # ladder that pins m*T the router silently reassigns
+                        # strategy as T falls. Leaving it on 'auto' conflates the
+                        # objective-count effect with a route-reassignment effect.
                         G = jdgram_gramian(model, modules, ov, sh, idx, tgt,
-                                           wdtype=wd).total
+                                           force_route=force_route,
+                                           wdtype=wd,
+                                           losses_fn=losses_fn).total
+                        if step == 0:
+                            conflict_stats = gramian_conflict_stats(G)
                         w = weighting(G.to(torch.float32))
                         ls = losses_fn()
                         ls.backward(w.to(ls.dtype))
                         curve.append(float(ls.mean().detach()))
+                        curve_obj.append(ls.detach().tolist())
                     opt.step()
                     opt.zero_grad(set_to_none=True)
                     if step == 0:  # steady state starts after the first step
@@ -1446,12 +1649,44 @@ def level11_aggregators(rc, dev, log: RunLogger, viol: Violations, dtype_name: s
                 Row(**base, metric="mean_last10",
                     value=sum(curve[-10:]) / len(curve[-10:]), unit="nats"),
                 Row(**base, metric="val_ce", value=val_ce, unit="nats"),
+                # val_ce is logged in nats, so perplexity is exp() of it. It was
+                # never stored, which left the one metric the project is judged
+                # on absent from every artifact. Guard the exp: a diverged cell
+                # can carry a val_ce large enough to overflow float64.
+                Row(**base, metric="val_perplexity",
+                    value=math.exp(val_ce) if val_ce < 700 else float("inf"),
+                    unit="ppl"),
                 Row(**base, metric="val_next_token_acc", value=val_acc, unit="frac"),
             ])
+            if conflict_stats is not None:
+                # Measured, not asserted from the mode label. A cell tagged
+                # "conflicting" whose min cosine is not near -1 did not actually
+                # conflict, and without this row that failure is invisible.
+                mean_cos, min_cos, offdiag = conflict_stats
+                log.many([
+                    Row(**base, metric="gramian_mean_offdiag_cos",
+                        value=mean_cos, unit="cos"),
+                    Row(**base, metric="gramian_min_offdiag_cos",
+                        value=min_cos, unit="cos"),
+                    Row(**base, metric="gramian_offdiag_mass",
+                        value=offdiag, unit="ratio"),
+                ])
             curve_base = {k: v for k, v in base.items() if k != "test"}
             for i, lv in enumerate(curve):
                 log.log(Row(**curve_base, test="train/curve",
                             metric=f"step_{i}", value=lv, unit="nats"))
+            per_obj_records.append({
+                "aggregator": agg_name, "engine": engine, "qp": qp_name,
+                "m": m, "T": T, "V": V, "steps": steps,
+                "val_ce": val_ce,
+                "val_perplexity": (math.exp(val_ce) if val_ce < 700
+                                   else float("inf")),
+                "curve_per_objective": curve_obj,
+            })
+            # Written after every cell, not once at the end: a run that dies on
+            # cell 9 should still leave the first eight readable.
+            with open(rc.path("l11_per_objective_curves.json"), "w") as fh:
+                json.dump(per_obj_records, fh)
             print(f"  {agg_name:<7} {engine:<9} {qp_name:<8} "
                   f"{per_step:7.2f} ms/step  peak {peak:8.1f} MiB  "
                   f"train {curve[-1]:.4f}  val_ce {val_ce:.4f}  acc {val_acc:.4f}")
@@ -1773,6 +2008,14 @@ def run_isolated(args, levels: list[str]) -> int:
             cmd += ["--driver", args.driver]
         if args.force_route is not None:
             cmd += ["--force-route", args.force_route]
+        if args.objective_mode != "independent":
+            cmd += ["--objective-mode", args.objective_mode]
+        if args.cost_model is not None:
+            # Dropping this one is worse than the shape flags above: the child
+            # falls back to the analytic rule while the manifest still records
+            # cost_model, so the run reads as a cost-model measurement and is
+            # not one. Every routing conclusion drawn from it would be wrong.
+            cmd += ["--cost-model", str(args.cost_model)]
         if args.qp_threads is not None:
             cmd += ["--qp-threads", str(args.qp_threads)]
         if args.jacopt is not None:
@@ -1817,6 +2060,25 @@ def main() -> None:
                         "GPT-2's ratio at every size (768/12, 1024/16)")
     p.add_argument("--driver", default=None, choices=[None, *DRIVERS])
     p.add_argument("--force-route", default=None, choices=[None, "tfirst", "dfirst"])
+    # str, NOT Path: the manifest is written with json.dumps(vars(args)), and
+    # a Path is not JSON-serializable -- declaring this as `type=Path` killed
+    # every run that used the flag, at manifest-write time, before any work
+    # happened. runtag.save_manifest now also coerces unknown types, so this
+    # cannot silently recur, but the argument stays a plain string.
+    p.add_argument("--cost-model", default=None, type=str,
+                   help="JSON from bench/calibrate_router.py. Installs a "
+                        "measured cost model so route=auto picks by predicted "
+                        "TIME instead of the shipped workspace-only rule. "
+                        "Ignored when --force-route pins the route. With this "
+                        "unset the router behaves exactly as before, so old "
+                        "and new runs stay comparable.")
+    p.add_argument("--objective-mode", default="independent",
+                   choices=list(OBJECTIVE_MODES),
+                   help="how the m objectives relate: independent (m separate "
+                        "corpus windows), duplicate (identical -> rank-1 Gramian), "
+                        "scaled (positively collinear), conflicting (alternating "
+                        "sign -> negative off-diagonal; diverges by construction, "
+                        "read its cost not its loss curve)")
     p.add_argument("--steps", type=int, default=100, help="L7 training steps")
     p.add_argument("--with-stack", action="store_true",
                    help="L9: record python stacks (slower, much larger trace)")
@@ -1863,6 +2125,20 @@ def main() -> None:
     sweep_drivers = (args.driver,) if args.driver else DRIVERS
     sweep_routes = (args.force_route,) if args.force_route else ROUTES
 
+    # Install the measured cost model before anything routes a layer. Loading
+    # it is deliberately explicit and opt-in: with no --cost-model the router
+    # keeps its analytic rule bit-for-bit, so every number already collected
+    # stays comparable to anything produced after this flag existed.
+    if args.cost_model is not None:
+        from jdgram import costmodel as _costmodel
+        _cm = _costmodel.load_and_use(args.cost_model)
+        print(f"[router] measured cost model installed from "
+              f"{args.cost_model} ({_cm.n_samples} shapes, fitted on "
+              f"{_cm.device}/{_cm.dtype})")
+        if args.force_route is not None:
+            print(f"[router] ...but --force-route {args.force_route} pins "
+                  f"every decision, so the model will not be consulted.")
+
     if args.isolate:
         sys.exit(run_isolated(args, levels))
 
@@ -1902,7 +2178,8 @@ def main() -> None:
                 for froute in sweep_routes:
                     level4_phases(rc, dev, log, viol, args.dtype, m=args.m, T=args.T,
                                   V=args.V, n_embd=args.n_embd, n_layer=args.n_layer,
-                                  driver=driver, force_route=froute)
+                                  driver=driver, force_route=froute,
+                                  objective_mode=args.objective_mode)
         if "L5" in levels:
             level5_ab(rc, dev, log, viol, args.dtype, m=args.m, T=args.T, V=args.V,
                       n_embd=args.n_embd, n_layer=args.n_layer)
@@ -1922,10 +2199,12 @@ def main() -> None:
                        threads=args.qp_threads)
         if "L11" in levels:
             level11_aggregators(rc, dev, log, viol, args.dtype, m=args.m,
-                                T=min(args.T, 256), V=args.V, n_embd=args.n_embd,
+                                T=args.T, V=args.V, n_embd=args.n_embd,
                                 n_layer=args.n_layer, steps=args.steps,
                                 eval_batches=args.eval_batches,
-                                use_jacopt=args.jacopt)
+                                use_jacopt=args.jacopt,
+                                force_route=args.force_route,
+                                objective_mode=args.objective_mode)
     except KeyboardInterrupt:
         status = "interrupted"
         print("\n[interrupted] rows written so far are already on disk")

@@ -78,7 +78,7 @@ def sequence_gramian(
         from jdgram.engine.router import route as pick_route
 
         m, T, d = A.shape
-        route = pick_route(m, T, num_embeddings * d)
+        route = pick_route(m, T, num_embeddings * d, num_embeddings, d)
     if route == "dfirst":
         if num_embeddings is None:
             raise ValueError("dfirst embedding route requires num_embeddings")
