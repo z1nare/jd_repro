@@ -313,8 +313,16 @@ def C0(a, sink):
 
 def C1(a, sink):
     print("\n=== C1  whole-Gramian exactness vs brute force ===", flush=True)
-    small = {"num_hidden_layers": a.bf_layers, "vocab_size": a.bf_vocab,
-             "hidden_size": a.bf_hidden}
+    # Shrink depth and vocabulary only. hidden_size is deliberately left alone:
+    # Qwen3.5 fixes head_dim independently (128 for the DeltaNet value heads, 256
+    # for attention), so overriding hidden gives a model whose head arithmetic no
+    # longer matches the real one -- and then a mismatch says nothing about the
+    # architecture being ported. Vocabulary is what has to shrink for the ground
+    # truth to fit: at 248320 x 1024 the embedding alone is 254M parameters, so a
+    # brute-force fp64 Jacobian would be 2 GiB per objective.
+    small = {"num_hidden_layers": a.bf_layers, "vocab_size": a.bf_vocab}
+    if a.bf_hidden:
+        small["hidden_size"] = a.bf_hidden
     for m in a.bf_ms:
         model = None
         with cell() as st:
@@ -539,7 +547,9 @@ def main() -> int:
     p.add_argument("--bf-ms", type=int, nargs="+", default=[2, 3])
     p.add_argument("--bf-layers", type=int, default=2)
     p.add_argument("--bf-vocab", type=int, default=2048)
-    p.add_argument("--bf-hidden", type=int, default=256)
+    p.add_argument("--bf-hidden", type=int, default=0,
+                   help="0 keeps the real hidden_size, so head_dim arithmetic "
+                        "matches the model being ported")
     p.add_argument("--bf-T", type=int, default=32)
     p.add_argument("--train-m", type=int, default=2)
     p.add_argument("--steps", type=int, default=50)
