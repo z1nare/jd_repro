@@ -70,7 +70,7 @@ class Sink:
         self.n += 1
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(kw, default=str) + "\n")
-        show = ("stage", "cell", "engine", "agg", "mode", "m", "T",
+        show = ("stage", "cell", "engine", "agg", "mode", "module", "type", "m", "T",
                 "metric", "value", "unit", "peak_mib", "status")
         print("  " + "  ".join(f"{k}={kw[k]}" for k in show if k in kw), flush=True)
 
@@ -328,6 +328,15 @@ def C1(a, sink):
         with cell() as st:
             try:
                 model, cfg = load(a.model, a.device, small=small)
+                # The whole model in float64, not just the Gramian workspace.
+                # `J` below is built by autograd on this same model, so on an fp32
+                # model it is not ground truth at all -- it carries fp32 error of
+                # its own, and the comparison measures the difference of two
+                # errors. That is why fp32 and fp64 *workspace* gave 1.4076e-05
+                # and 1.4101e-05: identical, because the model was fp32 in both.
+                # The gates reach 1e-10 by running the model itself in fp64.
+                if a.bf_fp64:
+                    model = model.double()
                 hooked, shared, tail = wire(model)
                 idx, co = batch(m, a.bf_T, cfg.vocab_size, "independent", a.device)
                 fn = losses_of(model, idx, co)
@@ -588,6 +597,9 @@ def main() -> int:
                    help="0 keeps the real hidden_size, so head_dim arithmetic "
                         "matches the model being ported")
     p.add_argument("--bf-T", type=int, default=32)
+    p.add_argument("--bf-fp64", type=int, default=1,
+                   help="run the ground-truth model itself in float64 (default). "
+                        "0 compares two fp32 computations and calls one of them truth")
     p.add_argument("--train-m", type=int, default=2)
     p.add_argument("--steps", type=int, default=50)
     p.add_argument("--lr", type=float, default=0.01)
