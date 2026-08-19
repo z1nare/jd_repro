@@ -25,7 +25,7 @@ token and positional embeddings, and the **tied embedding/head**. Attention
 needed no new mathematics — it holds no parameters of its own, and
 softmax/SDPA/GELU/residual contribute no Gramian terms at all.
 
-**44 gates, all passing.** Nothing ships until its gate does.
+**71 gates, all passing.** Nothing ships until its gate does.
 
 ```bash
 pytest gates/
@@ -60,9 +60,10 @@ it, which is the second of these and always costs `m · P_layer`. The first cost
 `P_layer` is large, as it is for a vocabulary head. `engine/router.py` chooses
 per layer.
 
-That router currently chooses on workspace alone and gets it wrong at
-vocabulary scale; see `jdgram/costmodel.py`. Both routes are numerically
-identical, so it costs time, never accuracy.
+The choice is made from measured per-kernel timings fitted on the target card
+(`jdgram/costmodel.py`, calibrated by `bench/calibrate_router.py`); with no
+calibration loaded it falls back to comparing workspace alone. Both routes are
+numerically identical, so the choice costs time, never accuracy.
 
 ## Layout
 
@@ -70,9 +71,10 @@ identical, so it costs time, never accuracy.
 src/jdgram/
   identities/   one module per layer family, each returning an [m,m] block
   engine/       hooks.py is the entry point; router.py picks the contraction
-                order; accumulate.py holds tied groups until every site is seen
-  costmodel.py  where a measured router rule would live (not implemented)
-gates/          44 correctness tests against brute-force autograd, float64
+                order; accumulate.py holds tied groups until every site is seen;
+                residual.py covers parameters with no closed form
+  costmodel.py  measured per-kernel cost model behind the router's choice
+gates/          71 correctness tests against brute-force autograd, float64
 bench/          profiling harness; profile_suite.py has levels L0-L11
 scripts/        cluster runbooks (these assume a GPU box, not a laptop)
 models/         karpathy's nanoGPT, vendored verbatim — see nanogpt/UPSTREAM.txt
@@ -100,10 +102,10 @@ general campaign, `scripts/run_gpt2_124m_cluster.sh` for GPT-2 124M.
 
 ## Results
 
-`REPORT_CIFAR_TO_NANOGPT.md` carries the measurements and the reasoning,
-including what did not work: an earlier convolutional result does not transfer
-to transformers, and the report says exactly why (it depended on there being one
-token per objective).
+Campaign results are build artifacts, not repository contents: run directories
+are written under `results/`, and `bench/make_evidence.py` and
+`bench/report_figures.py` turn them into tables and figures. Both are
+regenerable from a run directory plus the script, and neither is tracked.
 
 ## Credits
 

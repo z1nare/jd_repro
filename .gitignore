@@ -44,6 +44,17 @@ profiler_trace.json.gz
 # change it was meant to capture. Transfer results with the bundle stage instead.
 results/
 
+# Generated reporting output. The generators are tracked (bench/report_figures.py,
+# bench/make_evidence.py); their output is not. A figure or a results table is a
+# build artifact of a particular campaign -- reproducible from the run
+# directories plus the script, and stale the moment either changes.
+fig/
+docs/RESULTS.md
+acceptance.csv
+costmodel_*.json
+
 # Personal records, not repository artifacts.
 MEETING_DELIVERY.md
 internship-evidence-*.md
+docs/QWEN_MEETING_NOTES.md
+docs/QWEN_RESULTS.md

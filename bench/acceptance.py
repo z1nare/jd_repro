@@ -427,7 +427,7 @@ def main() -> int:
         # Taking max() here made the report's strongest claim -- "the floor is at
         # or above budget, no kernel work can reach the target" -- rest entirely
         # on whichever single cell was noisiest, and on this campaign that was
-        # literally the run docs/l4_l11_discrepancy.md argues is corrupted by host
+        # literally the run whose L4-vs-L11 gap is corrupted by host
         # interference (m=3 run A reads 1.579; its own repeat reads 1.389, a 14%
         # swing on a quantity that should barely move). A conclusion that flips on
         # the least trustworthy cell in the set is not a conclusion.

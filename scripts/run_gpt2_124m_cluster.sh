@@ -11,8 +11,8 @@
 #
 # WHY THIS SCRIPT EXISTS, SEPARATELY FROM run_profile_cluster.sh
 # --------------------------------------------------------------
-# Every number in REPORT_CIFAR_TO_NANOGPT.md was measured at <= 16.03M parameters
-# on a 4-layer, 256-wide model. Two of the report's central claims are therefore
+# Every number in the earlier CIFAR-to-nanoGPT campaign was measured at <= 16.03M
+# parameters on a 4-layer, 256-wide model. Two of its central claims are therefore
 # arithmetic rather than measurement, and both of them are claims a reviewer will
 # go after first:
 #
