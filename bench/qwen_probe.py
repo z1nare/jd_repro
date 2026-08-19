@@ -126,8 +126,57 @@ def collapse(model: nn.Module) -> list[str]:
     return sorted(unhandled)
 
 
+def _verify_modules(res, model, losses_fn, modules, m: int, k: int) -> None:
+    """Check k hooked modules' Gramian blocks against autograd ground truth.
+
+    Per-module rather than whole-model: the full [m, P] fp64 Jacobian for a 0.8B
+    model is m * 0.75e9 * 8 bytes = 6 GiB per objective, which will not sit
+    alongside the model on one card. A single module's block is tiny, and a
+    per-layer identity that agrees on a representative sample of layer types is
+    the claim that actually needs testing.
+    """
+    per_mod = res.per_module
+    # A tied pair's contribution lives in per_shared_group as one four-term block,
+    # not split across its members, so checking a member against its own params
+    # alone would report a spurious mismatch. Verify the untied modules here.
+    in_group = {n for g in getattr(res, "per_shared_group", {}) for n in g}
+    # One of each type present, so the sample tests identities rather than layers.
+    by_type: dict[str, str] = {}
+    for name in per_mod:
+        if name in modules and name not in in_group:
+            by_type.setdefault(type(modules[name]).__name__, name)
+    picks = list(by_type.values())[:k]
+    if not picks:
+        print("  (no per-module blocks to verify)")
+        return
+
+    print(f"\n  verifying {len(picks)} module(s) against autograd ground truth (fp64)")
+    print(f"    {'module':<44} {'type':<18} {'rel err':>10}")
+    losses = losses_fn()
+    for name in picks:
+        mod = modules[name]
+        params = [p for p in mod.parameters(recurse=False) if p.requires_grad]
+        if not params:
+            continue
+        rows = []
+        for i in range(m):
+            g = torch.autograd.grad(losses[i], params, retain_graph=True,
+                                    allow_unused=True)
+            rows.append(torch.cat([
+                (torch.zeros_like(p) if gi is None else gi).reshape(-1).double()
+                for gi, p in zip(g, params)
+            ]))
+        J = torch.stack(rows)
+        G_true = J @ J.T
+        G_got = per_mod[name].double()
+        den = G_true.abs().max().clamp_min(1e-30)
+        rel = ((G_got - G_true).abs().max() / den).item()
+        flag = "" if rel < 1e-6 else "   <-- MISMATCH"
+        print(f"    {name[:44]:<44} {type(mod).__name__:<18} {rel:>10.2e}{flag}")
+
+
 def live(model, tok, m: int, T: int, driver: str, device: str,
-         exclude: list[str] | None = None) -> None:
+         exclude: list[str] | None = None, verify: int = 0) -> None:
     """A real forward + Gramian, to see which guard fires first."""
     from jdgram.engine.hooks import compute_gramian
     from jdgram.identities.tied import tied_gramian
@@ -187,8 +236,10 @@ def live(model, tok, m: int, T: int, driver: str, device: str,
         cos = G / d.unsqueeze(0) / d.unsqueeze(1)
         print(f"  diagonal      {[f'{v:.4e}' for v in G.diagonal().tolist()]}")
         print(f"  off-diag cos  {[f'{v:+.4f}' for v in cos[~torch.eye(m, dtype=bool)].tolist()]}")
-        print(f"  peak memory   {torch.cuda.max_memory_allocated()/2**20:.0f} MiB"
-              if device.startswith("cuda") else "")
+        if device.startswith("cuda"):
+            print(f"  peak memory   {torch.cuda.max_memory_allocated()/2**20:.0f} MiB")
+        if verify and getattr(res, "per_module", None):
+            _verify_modules(res, model, losses_fn, modules, m, verify)
     except Exception as exc:                                   # noqa: BLE001
         import traceback
         print(f"  {type(exc).__name__}: {exc}\n")
@@ -208,6 +259,9 @@ def main() -> int:
     p.add_argument("--T", type=int, default=128)
     p.add_argument("--driver", default="loop", choices=("loop", "squashed", "batched"))
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--verify", type=int, default=0, metavar="K",
+                   help="check K hooked modules (one per type) against an "
+                        "fp64 autograd ground truth")
     p.add_argument("--allow-partial", action="store_true",
                    help="exclude modules with no identity and run anyway; the "
                         "resulting Gramian is PARTIAL, for diagnosis only")
@@ -256,7 +310,7 @@ def main() -> int:
     walk(model)
     skip = collapse(model)
     live(model, None, args.m, args.T, args.driver, args.device,
-         exclude=skip if args.allow_partial else None)
+         exclude=skip if args.allow_partial else None, verify=args.verify)
     return 0
 
 
