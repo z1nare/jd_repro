@@ -130,6 +130,7 @@ def live(model, tok, m: int, T: int, driver: str, device: str,
          exclude: list[str] | None = None) -> None:
     """A real forward + Gramian, to see which guard fires first."""
     from jdgram.engine.hooks import compute_gramian
+    from jdgram.identities.tied import tied_gramian
 
     print(f"\n{'='*100}\nLIVE GRAMIAN  (m={m}, T={T}, driver={driver!r})\n{'='*100}")
     V = model.config.vocab_size if hasattr(model.config, "vocab_size") else 1000
@@ -158,17 +159,28 @@ def live(model, tok, m: int, T: int, driver: str, device: str,
             if p.requires_grad:
                 owners.setdefault(id(p), []).append(nm)
     tied = {k: v for k, v in owners.items() if len(v) > 1}
-    if tied:
-        print(f"  TIED PARAMETERS across {len(tied)} group(s), e.g. "
-              f"{' == '.join(sorted(next(iter(tied.values())))[:2])}")
-        print("  no shared_handlers passed, so the cross terms are MISSING from this")
-        print("  Gramian. Diagnostic only -- see identities/tied.py for the four-term form.")
+    shared: dict = {}
+    for names in tied.values():
+        head = [n for n in names if isinstance(modules[n], nn.Linear)]
+        emb = [n for n in names if isinstance(modules[n], nn.Embedding)]
+        if len(names) == 2 and len(head) == 1 and len(emb) == 1:
+            h, e = head[0], emb[0]
+            print(f"  TIED: {e} == {h}  -> four-term identity (II.4)")
+            shared[frozenset(names)] = (
+                lambda caps, h=h, e=e: tied_gramian(
+                    caps[h].A, caps[h].X, caps[e].A, caps[e].X
+                )
+            )
+        else:
+            print(f"  TIED group {sorted(names)} is not a (Linear, Embedding) pair --")
+            print("  no handler wired, so its cross terms would be MISSING.")
 
     if exclude:
         print(f"  excluding {len(exclude)} module(s) with no identity --")
         print("  this Gramian is PARTIAL, not exact. Diagnostic only.")
     try:
-        res = compute_gramian(model, losses_fn, modules=modules, driver=driver)
+        res = compute_gramian(model, losses_fn, modules=modules,
+                              shared_handlers=shared or None, driver=driver)
         G = res.total if hasattr(res, "total") else res
         print(f"  SUCCESS  G={tuple(G.shape)} dtype={G.dtype}")
         d = G.diagonal().clamp_min(1e-30).sqrt()
@@ -178,7 +190,14 @@ def live(model, tok, m: int, T: int, driver: str, device: str,
         print(f"  peak memory   {torch.cuda.max_memory_allocated()/2**20:.0f} MiB"
               if device.startswith("cuda") else "")
     except Exception as exc:                                   # noqa: BLE001
-        print(f"  {type(exc).__name__}:\n    {exc}")
+        import traceback
+        print(f"  {type(exc).__name__}: {exc}\n")
+        tb = traceback.format_exc().splitlines()
+        # The frames inside jdgram are the informative ones; transformers'
+        # internals just add noise.
+        keep = [ln for ln in tb if "jdgram" in ln or "qwen_probe" in ln
+                or ln.strip().startswith(("File", "raise", "assert"))]
+        print("\n".join(f"  {ln}" for ln in keep[-14:]))
         print("\n  ^ this is the next thing to fix.")
 
 
@@ -223,9 +242,16 @@ def main() -> int:
         print("\nstructural pass only -- rerun without --structural-only for a live Gramian")
         return 0
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.float32, trust_remote_code=True
-    ).to(args.device)
+    # transformers 5.x takes `dtype`; 4.x spells the same thing `torch_dtype`.
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, dtype=torch.float32, trust_remote_code=True
+        )
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, torch_dtype=torch.float32, trust_remote_code=True
+        )
+    model = model.to(args.device)
     model.train()
     walk(model)
     skip = collapse(model)
