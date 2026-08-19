@@ -241,17 +241,32 @@ def losses_of(model, idx, coeffs):
 
 
 def gramian(model, fn, hooked, shared, tail, *, driver="loop", with_tail=True,
-            workspace_dtype=None):
+            workspace_dtype=None, use_leaf_edges=True):
     """Identity blocks plus the materialised tail.
 
     Two forwards when ``with_tail``: compute_gramian owns its own graph and frees
     it, so the residual needs a fresh one. Wasteful but honest -- and it is the
     real price of an exact Gramian on this model, so C2 reports it both ways
     rather than quietly charging jdgram the cheaper number.
+
+    ``use_leaf_edges`` is a real workaround, not a tuning knob. hooks.py's
+    _reverse_loop -- its own docstring: "Legacy m reverse passes -- gate/debug
+    path" -- computes the leaf-edge set ONCE from the whole [m] losses vector,
+    then reuses that fixed set across each objective's separate
+    torch.autograd.grad call. Measured failure: at m=3 on Qwen3.5,
+    model.embed_tokens registers zero backward captures on objective 0 even
+    though the forward called it exactly once -- the edge-pruned traversal
+    for that specific objective's autograd.grad apparently does not reach it.
+    m=2 does not exhibit this; root cause in edges.py's get_leaf_edges is not
+    yet isolated. use_leaf_edges=False bypasses the optimisation entirely --
+    _reverse_loop takes model.zero_grad() + losses[i].backward() per objective
+    instead, a full backward against every parameter rather than a pruned
+    graph walk. Slower, but sidesteps the pruning path where the bug lives.
     """
     res = compute_gramian(model, fn, modules=hooked,
                           shared_handlers=shared or None, driver=driver,
-                          workspace_dtype=workspace_dtype)
+                          workspace_dtype=workspace_dtype,
+                          use_leaf_edges=use_leaf_edges)
     G = res.total.double()
     if with_tail and tail:
         G = G + residual_gramian(fn(), [p for _, p in tail])
@@ -279,7 +294,7 @@ def C0(a, sink):
         with cell() as st:
             idx, co = batch(2, a.T, cfg.vocab_size, "independent", a.device)
             fn = losses_of(model, idx, co)
-            G, res = gramian(model, fn, hooked, shared, tail)
+            G, res = gramian(model, fn, hooked, shared, tail, use_leaf_edges=bool(a.use_leaf_edges))
             per_mod = {k: v.detach().clone() for k, v in res.per_module.items()}
             groups = {n for g in res.per_shared_group for n in g}
             diag = G[0, 0].item()
@@ -383,7 +398,7 @@ def C1(a, sink):
                 # error is round-off it collapses here; if it survives fp64 it is a
                 # bug in an identity or in how the blocks are assembled.
                 for tag, wd in (("fp32", torch.float32), ("fp64", torch.float64)):
-                    G, _ = gramian(model, fn, hooked, shared, tail, workspace_dtype=wd)
+                    G, _ = gramian(model, fn, hooked, shared, tail, workspace_dtype=wd, use_leaf_edges=bool(a.use_leaf_edges))
                     rel = ((G - true).abs().max() / den).item()
                     sink.row(stage="C1", cell="exactness", m=m, T=a.bf_T, P=P,
                              layers=a.bf_layers, vocab=a.bf_vocab, workspace=tag,
@@ -406,7 +421,7 @@ def C1(a, sink):
                         losses[i], handled_ps, retain_graph=(i < m - 1))]) for i in range(m)])
                 true_h = Jh @ Jh.T
                 Gh, _ = gramian(model, fn, hooked, shared, tail,
-                                with_tail=False, workspace_dtype=torch.float64)
+                                with_tail=False, workspace_dtype=torch.float64, use_leaf_edges=bool(a.use_leaf_edges))
                 relh = ((Gh - true_h).abs().max()
                         / true_h.abs().max().clamp_min(1e-30)).item()
                 sink.row(stage="C1", cell="identities_only", m=m, T=a.bf_T,
@@ -420,7 +435,7 @@ def C1(a, sink):
                 # config that actually fails -- verifying on the full pretrained
                 # model answers a different question.
                 _, res = gramian(model, fn, hooked, shared, tail,
-                                 with_tail=False, workspace_dtype=torch.float64)
+                                 with_tail=False, workspace_dtype=torch.float64, use_leaf_edges=bool(a.use_leaf_edges))
                 groups = {n for g in res.per_shared_group for n in g}
                 worst = []
                 for name, blk in res.per_module.items():
@@ -479,7 +494,7 @@ def C2(a, sink):
                         fn = losses_of(model, idx, co)
                         if engine == "jdgram":
                             call = lambda: gramian(model, fn, hooked, shared, tail,  # noqa: E731
-                                                   with_tail=tail_on)
+                                                   with_tail=tail_on, use_leaf_edges=bool(a.use_leaf_edges))
                         elif engine == "autogram":
                             from torchjd.autogram import Engine as AG
                             eng = AG(model, batch_dim=0)
@@ -532,7 +547,7 @@ def C3(a, sink):
                     try:
                         idx, co = batch(m, a.T, cfg.vocab_size, mode, a.device)
                         G, res = gramian(model, losses_of(model, idx, co),
-                                         hooked, shared, tail)
+                                         hooked, shared, tail, use_leaf_edges=bool(a.use_leaf_edges))
                         mn, mean = cosines(G)
                         per_layer = [(n, b.detach().double()) for n, b in res.per_module.items()]
                         del res
@@ -583,7 +598,7 @@ def C4(a, sink):
                         loss = L.mean().item()
                         L.mean().backward()
                     else:
-                        G, _ = gramian(model, fn, hooked, shared, tail)
+                        G, _ = gramian(model, fn, hooked, shared, tail, use_leaf_edges=bool(a.use_leaf_edges))
                         if wt is not None:
                             w = wt(G.float()).to(a.device).float()
                         else:
@@ -646,6 +661,11 @@ def main() -> int:
                    help="C0: check every hooked module, not one per type. Catches "
                         "an identity that is right for one call shape and wrong "
                         "for another; prints the worst offenders.")
+    p.add_argument("--use-leaf-edges", type=int, default=1,
+                   help="1 (default): compute_gramian's pruned-graph optimisation "
+                        "under driver=loop. 0: bypass it (model.zero_grad()+backward() "
+                        "per objective) -- the workaround for the m=3 "
+                        "'expected 1 backward capture' bug; see gramian()'s docstring.")
     p.add_argument("--mem-fraction", type=float, default=0.92,
                    help="cap the process at this fraction of the card, so an OOM is "
                         "raised cleanly instead of the driver killing a neighbour")
