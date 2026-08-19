@@ -259,11 +259,21 @@ def C0(a, sink):
         sink.row(stage="C0", cell="gramian", m=2, T=a.T, status="ok",
                  metric="diag0", value=diag, peak_mib=st.get("peak_mib"))
 
-        by_type: dict[str, str] = {}
-        for n in per_mod:
-            if n in hooked and n not in groups:
-                by_type.setdefault(type(hooked[n]).__name__, n)
+        # One per type is enough to catch a broken identity, but not to catch an
+        # identity that is right for one *call shape* and wrong for another. Qwen
+        # applies the same Qwen3_5RMSNorm class to rank-3 hidden states and to
+        # rank-4 per-head tensors, so sampling by type checks one and never the
+        # other. --verify-all walks every hooked module and reports the worst.
+        if a.verify_all:
+            targets = {n: n for n in per_mod if n in hooked and n not in groups}
+        else:
+            targets = {}
+            for n in per_mod:
+                if n in hooked and n not in groups:
+                    targets.setdefault(type(hooked[n]).__name__, n)
+        by_type = targets
 
+        worst: list[tuple[float, str, str]] = []
         for tname, name in by_type.items():
             with cell() as st:
                 try:
@@ -276,11 +286,26 @@ def C0(a, sink):
                     rel = ((per_mod[name].double() - true).abs().max()
                            / true.abs().max().clamp_min(1e-30)).item()
                     del J, true, losses
-                    sink.row(stage="C0", cell="verify", module=name, type=tname,
-                             metric="rel_err", value=rel,
-                             status="ok" if rel < 1e-6 else "MISMATCH")
+                    shape = tuple(hooked[name].weight.shape) if hasattr(
+                        hooked[name], "weight") else None
+                    worst.append((rel, name, type(hooked[name]).__name__))
+                    if not a.verify_all or rel >= 1e-6:
+                        sink.row(stage="C0", cell="verify", module=name,
+                                 type=type(hooked[name]).__name__, wshape=shape,
+                                 metric="rel_err", value=rel,
+                                 status="ok" if rel < 1e-6 else "MISMATCH")
                 except Exception as e:                            # noqa: BLE001
                     sink.fail("C0", "verify", e, module=name, type=tname)
+        if a.verify_all and worst:
+            worst.sort(reverse=True)
+            bad = sum(1 for r, _, _ in worst if r >= 1e-6)
+            sink.row(stage="C0", cell="verify_summary", n_checked=len(worst),
+                     n_mismatched=bad, metric="max_rel_err", value=worst[0][0],
+                     worst_module=worst[0][1], worst_type=worst[0][2],
+                     status="ok" if bad == 0 else "MISMATCH")
+            print("  worst 8 modules by relative error:", flush=True)
+            for rel, nm, tn in worst[:8]:
+                print(f"    {rel:.3e}  {tn:<22} {nm}", flush=True)
     finally:
         del model
         _scrub()
@@ -519,6 +544,10 @@ def main() -> int:
     p.add_argument("--train-m", type=int, default=2)
     p.add_argument("--steps", type=int, default=50)
     p.add_argument("--lr", type=float, default=0.01)
+    p.add_argument("--verify-all", action="store_true",
+                   help="C0: check every hooked module, not one per type. Catches "
+                        "an identity that is right for one call shape and wrong "
+                        "for another; prints the worst offenders.")
     p.add_argument("--mem-fraction", type=float, default=0.92,
                    help="cap the process at this fraction of the card, so an OOM is "
                         "raised cleanly instead of the driver killing a neighbour")
