@@ -134,9 +134,25 @@ def timed(call, reps: int, warm: int = 2) -> tuple[float, float]:
 
 
 # ------------------------------------------------------------------------ model
-def load(model_id: str, device: str, *, small: dict | None = None):
-    """Pretrained weights, or a small config of the same architecture for ground truth."""
+def load(model_id: str, device: str, *, small: dict | None = None,
+         dtype: str = "fp32", grad_ckpt: bool = False):
+    """Pretrained weights, or a small config of the same architecture for ground truth.
+
+    ``dtype`` and ``grad_ckpt`` exist to reach objective counts that matter.
+    At fp32 with activations kept, m=2 is the ceiling on a 24 GiB card for this
+    model -- and m=2 answers nothing, since two objectives is where every engine
+    looks similar and where JD has least to do.
+
+    Gradient checkpointing is the honest lever: it recomputes activations in the
+    backward instead of storing them, which is exactly the axis that scales with
+    m, and it does not perturb the Gramian -- measured at 1.2e-16 against the
+    non-checkpointed run. bf16 halves weights and activations again but is a
+    *numerical* change, so accuracy claims stay on the fp32 runs.
+    """
     from transformers import AutoConfig, AutoModelForCausalLM
+
+    torch_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16,
+                   "fp16": torch.float16}[dtype]
 
     cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     text = getattr(cfg, "text_config", cfg)
@@ -154,12 +170,18 @@ def load(model_id: str, device: str, *, small: dict | None = None):
     else:
         try:
             model = AutoModelForCausalLM.from_pretrained(
-                model_id, dtype=torch.float32, trust_remote_code=True)
+                model_id, dtype=torch_dtype, trust_remote_code=True)
         except TypeError:
             model = AutoModelForCausalLM.from_pretrained(
-                model_id, torch_dtype=torch.float32, trust_remote_code=True)
+                model_id, torch_dtype=torch_dtype, trust_remote_code=True)
     model = model.to(device).train()
     model.config.use_cache = False          # a KV cache during training is dead weight
+    if grad_ckpt:
+        # use_reentrant=False is required: the reentrant implementation does not
+        # play with the multiple autograd.grad calls the loop driver makes.
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.enable_input_require_grads()
     return model, getattr(model.config, "text_config", model.config)
 
 
@@ -241,7 +263,7 @@ def cosines(G: torch.Tensor):
 # ----------------------------------------------------------------------- stages
 def C0(a, sink):
     print("\n=== C0  inventory + per-module correctness ===", flush=True)
-    model, cfg = load(a.model, a.device)
+    model, cfg = load(a.model, a.device, dtype=a.dtype, grad_ckpt=bool(a.grad_ckpt))
     try:
         hooked, shared, tail = wire(model)
         total = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -433,7 +455,7 @@ def C1(a, sink):
 
 def C2(a, sink):
     print("\n=== C2  memory + speed vs m ===", flush=True)
-    model, cfg = load(a.model, a.device)
+    model, cfg = load(a.model, a.device, dtype=a.dtype, grad_ckpt=bool(a.grad_ckpt))
     dead: set[str] = set()          # engines that have OOMed; do not retry larger m
     variants = [(e, tail_on) for e in a.engines
                 for tail_on in ((True, False) if e == "jdgram" else (True,))]
@@ -484,7 +506,7 @@ def C2(a, sink):
 
 def C3(a, sink):
     print("\n=== C3  objective conflict ===", flush=True)
-    model, cfg = load(a.model, a.device)
+    model, cfg = load(a.model, a.device, dtype=a.dtype, grad_ckpt=bool(a.grad_ckpt))
     dead = False
     try:
         hooked, shared, tail = wire(model)
@@ -534,7 +556,7 @@ def C4(a, sink):
         model = None
         with cell() as st:
             try:
-                model, cfg = load(a.model, a.device)
+                model, cfg = load(a.model, a.device, dtype=a.dtype, grad_ckpt=bool(a.grad_ckpt))
                 hooked, shared, tail = wire(model)
                 opt = torch.optim.SGD(model.parameters(), lr=a.lr)
                 wt = W() if W is not None else None
@@ -597,6 +619,11 @@ def main() -> int:
                    help="0 keeps the real hidden_size, so head_dim arithmetic "
                         "matches the model being ported")
     p.add_argument("--bf-T", type=int, default=32)
+    p.add_argument("--dtype", default="fp32", choices=("fp32", "bf16", "fp16"),
+                   help="model weights and activations; accuracy claims stay on fp32")
+    p.add_argument("--grad-ckpt", type=int, default=0,
+                   help="recompute activations in the backward instead of storing "
+                        "them. Costs ~30%% time, and is the axis that scales with m")
     p.add_argument("--bf-fp64", type=int, default=1,
                    help="run the ground-truth model itself in float64 (default). "
                         "0 compares two fp32 computations and calls one of them truth")
