@@ -213,7 +213,8 @@ def losses_of(model, idx, coeffs):
     return fn
 
 
-def gramian(model, fn, hooked, shared, tail, *, driver="loop", with_tail=True):
+def gramian(model, fn, hooked, shared, tail, *, driver="loop", with_tail=True,
+            workspace_dtype=None):
     """Identity blocks plus the materialised tail.
 
     Two forwards when ``with_tail``: compute_gramian owns its own graph and frees
@@ -222,7 +223,8 @@ def gramian(model, fn, hooked, shared, tail, *, driver="loop", with_tail=True):
     rather than quietly charging jdgram the cheaper number.
     """
     res = compute_gramian(model, fn, modules=hooked,
-                          shared_handlers=shared or None, driver=driver)
+                          shared_handlers=shared or None, driver=driver,
+                          workspace_dtype=workspace_dtype)
     G = res.total.double()
     if with_tail and tail:
         G = G + residual_gramian(fn(), [p for _, p in tail])
@@ -296,7 +298,6 @@ def C1(a, sink):
                 hooked, shared, tail = wire(model)
                 idx, co = batch(m, a.bf_T, cfg.vocab_size, "independent", a.device)
                 fn = losses_of(model, idx, co)
-                G, _ = gramian(model, fn, hooked, shared, tail)
 
                 params = [p for p in model.parameters() if p.requires_grad]
                 P = sum(p.numel() for p in params)
@@ -305,13 +306,45 @@ def C1(a, sink):
                     torch.cat([g.reshape(-1).double() for g in torch.autograd.grad(
                         losses[i], params, retain_graph=(i < m - 1))]) for i in range(m)])
                 true = J @ J.T
-                rel = ((G - true).abs().max() / true.abs().max().clamp_min(1e-30)).item()
-                del J, true, losses
-                sink.row(stage="C1", cell="exactness", m=m, T=a.bf_T, P=P,
-                         layers=a.bf_layers, vocab=a.bf_vocab,
-                         residual_params=sum(p.numel() for _, p in tail),
-                         metric="rel_err", value=rel,
-                         status="ok" if rel < 1e-6 else "MISMATCH")
+                den = true.abs().max().clamp_min(1e-30)
+                del J, losses
+
+                # Both precisions, because the campaign's default is fp32 while the
+                # gates that produce the published accuracy figure pin fp64. If the
+                # error is round-off it collapses here; if it survives fp64 it is a
+                # bug in an identity or in how the blocks are assembled.
+                for tag, wd in (("fp32", torch.float32), ("fp64", torch.float64)):
+                    G, _ = gramian(model, fn, hooked, shared, tail, workspace_dtype=wd)
+                    rel = ((G - true).abs().max() / den).item()
+                    sink.row(stage="C1", cell="exactness", m=m, T=a.bf_T, P=P,
+                             layers=a.bf_layers, vocab=a.bf_vocab, workspace=tag,
+                             residual_params=sum(p.numel() for _, p in tail),
+                             metric="rel_err", value=rel,
+                             status="ok" if rel < 1e-6 else "MISMATCH")
+                    del G
+
+                # Split the discrepancy: identities alone against a ground truth over
+                # only the parameters they own. If this is clean, the assembly or the
+                # materialised tail is at fault, not the closed forms.
+                handled_ps, seen = [], set()
+                for n, mod in hooked.items():
+                    for p in mod.parameters(recurse=False):
+                        if p.requires_grad and id(p) not in seen:
+                            seen.add(id(p)); handled_ps.append(p)
+                losses = fn()
+                Jh = torch.stack([
+                    torch.cat([g.reshape(-1).double() for g in torch.autograd.grad(
+                        losses[i], handled_ps, retain_graph=(i < m - 1))]) for i in range(m)])
+                true_h = Jh @ Jh.T
+                Gh, _ = gramian(model, fn, hooked, shared, tail,
+                                with_tail=False, workspace_dtype=torch.float64)
+                relh = ((Gh - true_h).abs().max()
+                        / true_h.abs().max().clamp_min(1e-30)).item()
+                sink.row(stage="C1", cell="identities_only", m=m, T=a.bf_T,
+                         workspace="fp64", n_params=len(handled_ps),
+                         metric="rel_err", value=relh,
+                         status="ok" if relh < 1e-6 else "MISMATCH")
+                del Jh, true_h, Gh, true, losses
             except Exception as e:                                # noqa: BLE001
                 sink.fail("C1", "exactness", e, m=m)
             finally:
