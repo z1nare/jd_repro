@@ -147,11 +147,28 @@ def live(model, tok, m: int, T: int, driver: str, device: str,
         return per_tok.mean(dim=1)
 
     modules = registry.collect_hookable_modules(model, exclude=set(exclude or []))
+
+    # Tied parameters are only additive across modules when the cross terms are
+    # supplied via shared_handlers. Summing per-module Gramians over a tied pair
+    # drops them -- the exact defect jdgram measures autogram committing on
+    # GPT-2. Detect and say so rather than print a confident wrong number.
+    owners: dict[int, list[str]] = {}
+    for nm, mod in modules.items():
+        for p in mod.parameters(recurse=False):
+            if p.requires_grad:
+                owners.setdefault(id(p), []).append(nm)
+    tied = {k: v for k, v in owners.items() if len(v) > 1}
+    if tied:
+        print(f"  TIED PARAMETERS across {len(tied)} group(s), e.g. "
+              f"{' == '.join(sorted(next(iter(tied.values())))[:2])}")
+        print("  no shared_handlers passed, so the cross terms are MISSING from this")
+        print("  Gramian. Diagnostic only -- see identities/tied.py for the four-term form.")
+
     if exclude:
         print(f"  excluding {len(exclude)} module(s) with no identity --")
         print("  this Gramian is PARTIAL, not exact. Diagnostic only.")
     try:
-        res = compute_gramian(losses_fn, modules, m=m, driver=driver)
+        res = compute_gramian(model, losses_fn, modules=modules, driver=driver)
         G = res.total if hasattr(res, "total") else res
         print(f"  SUCCESS  G={tuple(G.shape)} dtype={G.dtype}")
         d = G.diagonal().clamp_min(1e-30).sqrt()
