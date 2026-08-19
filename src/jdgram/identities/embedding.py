@@ -30,9 +30,15 @@ def sequence_gramian_tfirst(
     m_a = (A_flat @ A_flat.T).reshape(m, t, m, t)
 
     idx_flat = idx.reshape(-1)
-    # bool [m,t,m,t] — multiply in workspace dtype via einsum (no .double() mask)
     mask = (idx_flat.unsqueeze(0) == idx_flat.unsqueeze(1)).reshape(m, t, m, t)
-    return torch.einsum("itjs,itjs->ij", m_a, mask.to(wd)).double()
+    # Multiply the bool mask straight into the kernel and reduce, rather than
+    # einsum("itjs,itjs->ij", m_a, mask.to(wd)). Two costs disappear: mask.to(wd)
+    # materialised a second [m,t,m,t] in workspace dtype, and einsum with matching
+    # labels clones each operand before contracting (the same trap documented in
+    # linear.sequence_gramian). Type promotion handles bool * float in one fused
+    # elementwise kernel. Measured at T=512: 1.36-1.87x faster and 30-44% leaner
+    # across m=2..8, bit-identical at m=2 and within fp32 round-off above it.
+    return (m_a * mask).sum(dim=(1, 3)).double()
 
 
 def sequence_gramian_dfirst(
