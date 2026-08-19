@@ -56,7 +56,7 @@ def residual_gramian(
     losses: torch.Tensor,
     params: list[torch.nn.Parameter],
     *,
-    retain_graph: bool = True,
+    retain_graph: bool = False,
     allow_unused: bool = True,
 ) -> torch.Tensor:
     """``[m, m]`` float64 Gramian of the given parameters, by explicit Jacobian.
@@ -68,6 +68,14 @@ def residual_gramian(
     A parameter that does not participate in an objective's graph yields ``None``
     from ``autograd.grad``; that is a true zero row-block, not an error, so
     ``allow_unused`` defaults to True and the gradient is taken as zero.
+
+    ``retain_graph`` defaults to False so the final backward frees the graph. Set
+    it True only when the caller still needs that graph afterwards -- leaving it
+    on holds every activation alive for the rest of the step, which on a 0.8B
+    model at m=8 is gigabytes for no benefit.
+
+    Uses ``autograd.grad`` rather than ``backward``, so nothing is accumulated
+    into ``.grad`` and the caller's optimiser state is untouched.
     """
     if not params:
         m = losses.shape[0]
