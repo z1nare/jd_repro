@@ -377,7 +377,44 @@ def C1(a, sink):
                          workspace="fp64", n_params=len(handled_ps),
                          metric="rel_err", value=relh,
                          status="ok" if relh < 1e-6 else "MISMATCH")
-                del Jh, true_h, Gh, true, losses
+                del Jh, true_h, Gh
+
+                # If the assembled sum is wrong while every block is right, the
+                # fault is in assembly, not in a closed form. Localise it on the
+                # config that actually fails -- verifying on the full pretrained
+                # model answers a different question.
+                _, res = gramian(model, fn, hooked, shared, tail,
+                                 with_tail=False, workspace_dtype=torch.float64)
+                groups = {n for g in res.per_shared_group for n in g}
+                worst = []
+                for name, blk in res.per_module.items():
+                    if name in groups or name not in hooked:
+                        continue
+                    ps = [p for p in hooked[name].parameters(recurse=False)
+                          if p.requires_grad]
+                    if not ps:
+                        continue
+                    L = fn()
+                    Jm = torch.stack([
+                        torch.cat([g.reshape(-1).double() for g in torch.autograd.grad(
+                            L[i], ps, retain_graph=(i < m - 1))]) for i in range(m)])
+                    tm = Jm @ Jm.T
+                    e = ((blk.double() - tm).abs().max()
+                         / tm.abs().max().clamp_min(1e-30)).item()
+                    worst.append((e, name, type(hooked[name]).__name__))
+                    del Jm, tm, L
+                worst.sort(reverse=True)
+                for e, name, tname in worst[:8]:
+                    sink.row(stage="C1", cell="per_module_small", m=m, module=name,
+                             type=tname, metric="rel_err", value=e,
+                             status="ok" if e < 1e-6 else "MISMATCH")
+                sink.row(stage="C1", cell="per_module_summary", m=m,
+                         n_checked=len(worst), metric="max_rel_err",
+                         value=worst[0][0] if worst else float("nan"),
+                         worst_module=worst[0][1] if worst else None,
+                         worst_type=worst[0][2] if worst else None,
+                         status="ok" if worst and worst[0][0] < 1e-6 else "MISMATCH")
+                del res, worst, true, losses
             except Exception as e:                                # noqa: BLE001
                 sink.fail("C1", "exactness", e, m=m)
             finally:
