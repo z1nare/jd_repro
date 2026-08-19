@@ -181,7 +181,12 @@ def load(model_id: str, device: str, *, small: dict | None = None,
         # play with the multiple autograd.grad calls the loop driver makes.
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
-        model.enable_input_require_grads()
+        # Deliberately NOT enable_input_require_grads(): it calls requires_grad_()
+        # on the embedding output, and autogram runs its backward under a functorch
+        # transform that forbids that -- so switching checkpointing on was breaking
+        # the engine being compared against, not just this one. It is only needed
+        # when the inputs would otherwise not require grad (frozen embeddings,
+        # LoRA), which is not the case here.
     return model, getattr(model.config, "text_config", model.config)
 
 
@@ -483,7 +488,14 @@ def C2(a, sink):
                             from torchjd.autojac import backward as ajb
                             ps = [p for p in model.parameters() if p.requires_grad]
                             def call():                                            # noqa: E306
-                                ajb(fn(), ps)
+                                # torchjd 0.17 takes only the tensors positionally;
+                                # the parameter list is the `inputs` keyword. Passing
+                                # it positionally raised "backward() takes 1
+                                # positional argument but 2 were given".
+                                try:
+                                    ajb(fn(), inputs=ps)
+                                except TypeError:
+                                    ajb(fn(), ps)
                                 for p in ps:                # autojac accumulates into
                                     p.grad = None           # .grad; do not let it pile up
                         med, best = timed(call, a.reps)
