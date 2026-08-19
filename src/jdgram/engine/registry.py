@@ -32,7 +32,7 @@ human-readable view of this dispatch, including each entry's gate status.
 
 from __future__ import annotations
 
-from typing import Callable, Protocol
+from typing import Callable, Container, Protocol
 
 import torch
 from torch import nn
@@ -233,30 +233,68 @@ def check_module_supported(name: str, module: nn.Module) -> None:
 def collect_hookable_modules(
     model: nn.Module,
     prefix: str = "",
+    *,
+    exclude: Container[str] | None = None,
 ) -> dict[str, nn.Module]:
     """Modules owning trainable parameters *directly*, keyed by qualified name.
 
-    Recurses only into modules with no direct trainable parameters, which is what
-    keeps a parent and its child from both claiming the same parameter. For
-    nanoGPT this yields ``wte``, ``wpe``, each block's norms and Linears, ``ln_f``
-    and ``lm_head`` -- and skips ``Block`` / ``MLP`` / ``CausalSelfAttention``,
-    whose only parameters live in children.
+    A module is collected when it owns direct trainable parameters. The walk then
+    continues into its children regardless, because a module can be both a
+    parameter holder and a container.
+
+    That distinction matters. An earlier version returned as soon as a module
+    owned direct parameters, on the reasoning that a parent and child must not
+    both claim the same parameter -- true, but the premise does not follow.
+    ``nn.Linear``/``nn.Embedding``/norms have no parameterized children, so for
+    those the two behaviours are identical. For a block that holds a couple of
+    bare ``nn.Parameter``\\ s *and* several parameterized submodules, stopping
+    early made the whole block one opaque unit and its children unreachable.
+    Qwen3.5's ``Qwen3_5GatedDeltaNet`` is exactly that shape: 32 direct
+    parameters (``A_log``, ``dt_bias``) in front of five ``nn.Linear``
+    submodules, so 18 blocks hid ~190M parameters -- a quarter of the model --
+    behind handlers that already existed.
+
+    Each collected module's handler is responsible for that module's *direct*
+    parameters only. That is automatic for every identity registered today,
+    since none of them has parameterized children.
+
+    ``exclude`` drops qualified names from the result. Use it to knowingly leave
+    out a module whose direct parameters have no identity, when the caller
+    accepts the Gramian is then partial -- ``dispatch`` still raises for anything
+    collected and unhandled, so omission has to be deliberate rather than silent.
 
     Parameter-free ops (SDPA, GELU, residual adds, Dropout) never appear: they
     hold nothing, so II.6 applies and autograd propagates ``A`` through them
     with no identity needed.
     """
     collected: dict[str, nn.Module] = {}
+    name = prefix or type(model).__name__
 
     if any(p.requires_grad for p in model.parameters(recurse=False)):
-        check_module_supported(prefix or type(model).__name__, model)
-        collected[prefix or type(model).__name__] = model
-        return collected
+        if exclude is None or name not in exclude:
+            check_module_supported(name, model)
+            collected[name] = model
 
     for child_name, child in model.named_children():
         qualified = f"{prefix}.{child_name}" if prefix else child_name
-        collected.update(collect_hookable_modules(child, qualified))
+        collected.update(collect_hookable_modules(child, qualified, exclude=exclude))
     return collected
+
+
+def unhandled_direct_params(model: nn.Module) -> dict[str, int]:
+    """Qualified name -> direct trainable parameter count, for modules with no identity.
+
+    What a partial run would silently omit. Reported so the caller can decide
+    whether the omission is acceptable before passing those names to
+    :func:`collect_hookable_modules`'s ``exclude``.
+    """
+    out: dict[str, int] = {}
+    for name, mod in model.named_modules():
+        direct = [p for p in mod.parameters(recurse=False) if p.requires_grad]
+        if not direct or has_handler(mod):
+            continue
+        out[name or type(mod).__name__] = sum(p.numel() for p in direct)
+    return out
 
 
 def find_shared_parameters(modules: dict[str, nn.Module]) -> dict[str, list[str]]:
