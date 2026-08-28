@@ -55,11 +55,10 @@ autogram  ███████████████████████�
 | 4 | **OOM** | **13,108.8** | 3,223.5 |
 | 5 | not attempted | **15,691.5** | 4,059.7 |
 | 6 | not attempted | **18,227.9** | 5,067.3 |
-| 7 | not attempted | OOM @ 18,816 † | — |
+| 7 | not attempted | **20,648.2** † | 7,061.2 |
 
-† default allocator. The `expandable_segments` retry was run while another job held
-the card (1.3 MB free at failure), so **m=7 is untested, not disproven**. The law
-predicts 17,891 MiB delta → ~20,777 peak, inside the 22,190 cap.
+† with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. Default allocator OOMs at
+18,816 — fragmentation, not capacity.
 
 ```
 peak MiB, 22,190 cap                        19 Aug        28 Aug
@@ -68,8 +67,10 @@ m=3  ███████████░░░░░░░░░░░  10,630 
 m=4  █████████████░░░░░░░░░  13,109            OOM   →    13,109   unlocked
 m=5  ████████████████░░░░░░  15,692              —          15,692
 m=6  ██████████████████░░░░  18,228              —          18,228
-m=7  ██████████████████████  OOM (fragmentation, peaked 18,816 of 22,190)
+m=7  ████████████████████░░  20,648            OOM   →    20,648   unlocked
 ```
+
+**Objective ceiling: m=3 → m=7.** Predicted peak 20,780, measured 20,648 — **0.6%**.
 
 ---
 
@@ -90,12 +91,19 @@ Validation across **both axes**, both dtypes:
 | fp32 | 5 | 256 | 1,280 | 12,821.3 | 12,784 | 0.3% |
 | **fp32** | **6** | **256** | **1,536** | **15,341.5** | 15,326 | 0.1% |
 | **fp32** | **2** | **768** | **1,536** | **15,307.9** | 15,326 | 0.1% |
-| fp32 | 2 | 896 | 1,792 | 17,790.1 | 17,868 | 0.4% |
+| **fp32** | **7** | **256** | **1,792** | **17,761.8** | 17,868 | 0.6% |
+| **fp32** | **2** | **896** | **1,792** | **17,790.1** | 17,868 | 0.4% |
 | bf16 | 2 | 1024 | 2,048 | 10,226.6 | 10,231 | 0.0% |
 | bf16 | 2 | 1536 | 3,072 | 15,301.3 | 15,313 | 0.1% |
+| bf16 | 2 | 2048 | 4,096 | fits (peak 21.9 GB) | 20,393 | — |
 
-**Rows 5 and 6:** same `m·T`, opposite splits (6 objectives × 256 tokens vs 2 × 768) —
-**33 MiB apart (0.2%)**. Memory depends on the product, not the split.
+**Two independent confirmations that only the product matters** — same `m·T`, opposite
+splits:
+
+| m·T | tall split | wide split | apart |
+|---:|---|---|---:|
+| 1,536 | m=6 × T=256 → 15,341.5 | m=2 × T=768 → 15,307.9 | **33.6 MiB (0.22%)** |
+| 1,792 | m=7 × T=256 → 17,761.8 | m=2 × T=896 → 17,790.1 | **28.3 MiB (0.16%)** |
 
 **bf16 slope is 4.956 = 9.93 / 2.00** — the law is dtype-scaled exactly.
 
