@@ -56,6 +56,7 @@ from jdgram.engine.registry import (
     dispatch,
     find_shared_parameters,
 )
+from jdgram.engine.residual import flatten_residual_row, gramian_from_rows
 from jdgram.engine.router import force_route as set_force_route
 from jdgram.engine.router import get_force_route
 from jdgram.identities.precision import workspace_dtype as workspace_dtype_ctx
@@ -107,6 +108,12 @@ class ModuleCapture:
     # reads ``A`` from returned grads and ignores whatever lands here, so keeping
     # a copy of every module's vmap slice would be pure waste.
     collect: bool = False
+    # Loop driver only, set by ``_reverse_loop`` before each pass: which
+    # objective is currently seeded, and whether this module's gradients carry a
+    # leading objective dimension. Together they let ``record_backward`` keep
+    # only the row that is not identically zero -- see there for why that matters.
+    objective: int | None = None
+    batched: bool = True
 
     def record_forward(self, args: tuple[PyTree, ...], outputs: list[Tensor]) -> None:
         self.forward_calls += 1
@@ -119,7 +126,24 @@ class ModuleCapture:
         elif self.collect:
             # clone, not detach: the loop driver holds these past the backward
             # call, and aten::detach has no vmap batching rule.
-            self.grads.append(tuple(g.clone() for g in grad_outputs))
+            #
+            # Clone the *seeded row*, not the whole gradient. The forward runs
+            # once at batch m, so a hooked module's gradient arrives shaped
+            # ``[m, ...]`` on every pass -- but ``losses[i]`` depends on batch row
+            # ``i`` alone, so the other m-1 rows are identically zero. Slicing
+            # here rather than at the end of the pass is what makes the slice
+            # cheap: ``g[i]`` is a *view*, and a view pins its parent's entire
+            # storage, so holding one per objective kept all m full gradients
+            # alive at once and made captures cost m^2 instead of m.
+            if self.objective is None:
+                self.grads.append(tuple(g.clone() for g in grad_outputs))
+            else:
+                self.grads.append(
+                    tuple(
+                        _objective_slice(g, self.objective, self.batched).clone()
+                        for g in grad_outputs
+                    )
+                )
 
     def take_input(self) -> PyTree:
         """Pop the forward capture, detached. Detaching is load-bearing: ``X``
@@ -140,6 +164,9 @@ class GramianResult:
     total: Tensor
     per_module: dict[str, Tensor]
     per_shared_group: dict[frozenset[str], Tensor]
+    #: ``[m, m]`` block for ``residual_params``, already included in ``total``.
+    #: ``None`` when no residual parameters were passed.
+    residual: Tensor | None = None
     #: Bytes of captures simultaneously pinned at the streaming high-water mark.
     #: Zero for an untied model under ``squashed`` -- every layer frees on the spot.
     peak_held_bytes: int = 0
@@ -382,24 +409,50 @@ def _reverse_loop(
     manager: ModuleHookManager,
     modules: dict[str, nn.Module],
     batched: dict[str, bool],
-) -> dict[str, Tensor]:
-    """Legacy m reverse passes -- gate/debug path."""
+    residual_params: list[nn.Parameter] | None = None,
+) -> tuple[dict[str, Tensor], list[Tensor] | None]:
+    """Legacy m reverse passes -- gate/debug path.
+
+    Returns ``(A_by_name, residual_rows)``. ``residual_rows`` is ``None`` unless
+    ``residual_params`` was given, in which case it holds one flattened float64
+    gradient row per objective, harvested from the same passes.
+    """
     stacked: dict[str, list[Tensor]] = {name: [] for name in modules}
+    for name, capture in manager.captures.items():
+        capture.batched = batched[name]
+    tail = list(residual_params or [])
+    residual_rows: list[Tensor] | None = [] if tail else None
     for i in range(m):
         for capture in manager.captures.values():
             capture.clear_grads()
+            # record_backward keeps only row i; without this it would have to
+            # clone the whole [m, ...] gradient and the loop would pin all m.
+            capture.objective = i
 
         retain = i < m - 1
         if leaf_edges:
-            torch.autograd.grad(
+            # The tail rides along: this pass already walks the graph, and the
+            # return value was previously discarded (captures are side effects),
+            # so appending the tail parameters costs one extra hop per parameter
+            # instead of a whole second forward plus m more backwards.
+            grads = torch.autograd.grad(
                 outputs=losses[i],
-                inputs=leaf_edges,
+                inputs=list(leaf_edges) + tail,
                 retain_graph=retain,
                 allow_unused=True,
             )
+            if residual_rows is not None:
+                residual_rows.append(
+                    flatten_residual_row(grads[len(leaf_edges):], tail)
+                )
         else:
             model.zero_grad(set_to_none=True)
             losses[i].backward(retain_graph=retain)
+            if residual_rows is not None:
+                # zero_grad above ran this iteration, so .grad is exactly dL_i/dp.
+                residual_rows.append(
+                    flatten_residual_row([p.grad for p in tail], tail)
+                )
 
         for name, capture in manager.captures.items():
             if len(capture.grads) != 1:
@@ -414,10 +467,11 @@ def _reverse_loop(
                     f"{name}: {len(grad_outputs)} differentiable outputs. Multi-output "
                     f"modules need an identity that consumes all of them."
                 )
-            stacked[name].append(
-                _objective_slice(grad_outputs[0], i, batched[name])
-            )
-    return {name: torch.stack(parts) for name, parts in stacked.items()}
+            # Already sliced to objective i inside record_backward, and cloned
+            # there, so this owns its storage rather than viewing a full [m, ...].
+            stacked[name].append(grad_outputs[0])
+    A_by_name = {name: torch.stack(parts) for name, parts in stacked.items()}
+    return A_by_name, residual_rows
 
 
 def _reverse_batched(
@@ -427,7 +481,8 @@ def _reverse_batched(
     leaf_edges: list,
     manager: ModuleHookManager,
     batched: dict[str, bool],
-) -> dict[str, Tensor]:
+    residual_params: list[nn.Parameter] | None = None,
+) -> tuple[dict[str, Tensor], list[Tensor] | None]:
     """Single reverse pass: seed all m objectives via ``is_grads_batched``.
 
     ``A`` is taken from returned grads w.r.t. each module's wrapped outputs.
@@ -452,15 +507,29 @@ def _reverse_batched(
             )
         grad_inputs.append(cap.rg_outputs[0])
 
+    tail = list(residual_params or [])
     eye = torch.eye(m, device=losses.device, dtype=losses.dtype)
     grads = torch.autograd.grad(
         outputs=losses,
-        inputs=grad_inputs,
+        inputs=grad_inputs + tail,
         grad_outputs=eye,
         is_grads_batched=True,
         retain_graph=False,
         allow_unused=True,
     )
+    residual_rows: list[Tensor] | None = None
+    if tail:
+        # Under is_grads_batched each parameter's gradient comes back [m, *shape],
+        # so row i is objective i's -- the same rows the loop driver builds one
+        # pass at a time, from a single backward.
+        tail_grads = grads[len(grad_inputs):]
+        grads = grads[: len(grad_inputs)]
+        residual_rows = [
+            flatten_residual_row(
+                [None if g is None else g[i] for g in tail_grads], tail
+            )
+            for i in range(m)
+        ]
     out: dict[str, Tensor] = {}
     for name, grad in zip(names, grads, strict=True):
         if grad is None:
@@ -474,7 +543,7 @@ def _reverse_batched(
                 f"got {tuple(grad.shape)}"
             )
         out[name] = _assemble_A(grad, batched[name])
-    return out
+    return out, residual_rows
 
 
 def _resolve_driver(driver: Driver | None, batched_backward: bool | None) -> Driver:
@@ -505,6 +574,7 @@ def compute_gramian(
     batched_backward: bool | None = None,
     force_route: str | None = None,
     workspace_dtype: torch.dtype | None = None,
+    residual_params: list[nn.Parameter] | None = None,
 ) -> GramianResult:
     """Exact Gramian of the m objectives, accumulated per hooked module.
 
@@ -533,6 +603,14 @@ def compute_gramian(
         :func:`jdgram.identities.precision.workspace_dtype`. ``None`` leaves the
         process default (fp32, or whatever gates pinned). Final ``[m, m]`` still
         accumulates in float64.
+    :param residual_params: parameters with no closed-form identity, whose exact
+        ``[m, m]`` block is built by explicit Jacobian and added into ``total``
+        (also exposed as ``GramianResult.residual``). Their gradients are taken
+        from the reverse pass this call already runs, so the tail costs one extra
+        hop per parameter rather than a second forward and ``m`` more backwards
+        -- which is what calling :func:`jdgram.engine.residual.residual_gramian`
+        separately costs. ``loop`` and ``batched`` only; see there for why
+        ``squashed`` cannot.
 
     ``per_module`` is what per-layer gates diff against brute force's per-parameter
     blocks, so a failure names its layer instead of only reporting that the total
@@ -558,6 +636,7 @@ def compute_gramian(
                 batched_overrides=batched_overrides,
                 use_leaf_edges=use_leaf_edges,
                 driver=resolved,
+                residual_params=residual_params,
             )
     finally:
         set_force_route(prev_force)
@@ -594,10 +673,20 @@ def _compute_gramian_body(
     batched_overrides: dict[str, bool] | None,
     use_leaf_edges: bool,
     driver: Driver,
+    residual_params: list[nn.Parameter] | None = None,
 ) -> GramianResult:
     handler_overrides = handler_overrides or {}
     shared_handlers = shared_handlers or {}
     batched_overrides = batched_overrides or {}
+
+    if residual_params and driver == "squashed":
+        raise NotImplementedError(
+            "driver='squashed' cannot supply per-objective residual rows: its "
+            "single ones-seeded backward yields the sum over objectives, not one "
+            "row each, and it frees the graph as it sweeps. Use driver='loop' or "
+            "'batched', or call jdgram.engine.residual.residual_gramian on a "
+            "separate forward."
+        )
 
     if modules is None:
         modules = collect_hookable_modules(model)
@@ -686,21 +775,25 @@ def _compute_gramian_body(
                 # Identities run inside GramianNode.backward, under no_grad.
                 _reverse_squashed(losses=losses, leaf_edges=leaf_edges, manager=manager)
                 A_by_name = None
+                residual_rows = None
             elif driver == "batched":
-                A_by_name = _reverse_batched(
+                A_by_name, residual_rows = _reverse_batched(
                     m=m, losses=losses, leaf_edges=leaf_edges,
                     manager=manager, batched=batched,
+                    residual_params=residual_params,
                 )
             else:
-                A_by_name = _reverse_loop(
+                A_by_name, residual_rows = _reverse_loop(
                     m=m, losses=losses, model=model, leaf_edges=leaf_edges,
                     manager=manager, modules=modules, batched=batched,
+                    residual_params=residual_params,
                 )
         finally:
             manager.phase.value = False
             for capture in manager.captures.values():
                 capture.stream = None
                 capture.collect = False
+                capture.objective = None
 
         if driver == "squashed":
             missed = sorted(set(modules) - stream.visited)  # type: ignore[union-attr]
@@ -754,10 +847,20 @@ def _compute_gramian_body(
 
     if accumulator.total is None:
         raise RuntimeError("no Gramian contributions were accumulated")
+
+    total = accumulator.total.detach()
+    residual_block: Tensor | None = None
+    if residual_rows is not None:
+        # Same [m, m] block residual_gramian would have produced from its own
+        # forward and its own m backwards -- harvested from the passes above.
+        residual_block = gramian_from_rows(residual_rows)
+        total = total + residual_block.to(dtype=total.dtype, device=total.device)
+
     return GramianResult(
-        total=accumulator.total.detach(),
+        total=total,
         per_module=accumulator.per_module,
         per_shared_group=accumulator.per_shared_group,
+        residual=residual_block,
         peak_held_bytes=held,
         driver=driver,
     )

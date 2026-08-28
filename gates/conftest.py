@@ -18,6 +18,31 @@ GATE_SEED = 0
 DATA_SEED = 1
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _ieee_fp32_matmul():
+    """Pin full-precision fp32 matmul for the whole session.
+
+    TF32 silently drops fp32 mantissa from 24 bits to 11, which is far coarser
+    than the atol=1e-10 these gates assert. PyTorch has defaulted it off, but the
+    knob has already been renamed once (``allow_tf32`` -> ``fp32_precision`` in
+    2.9) and a future default flip would turn every gate here into a
+    rubber stamp rather than a failure. Set it explicitly instead of inheriting.
+    """
+    saved: list[tuple[object, str, object]] = []
+    for backend in (torch.backends.cuda.matmul, torch.backends.cudnn):
+        if hasattr(backend, "fp32_precision"):
+            saved.append((backend, "fp32_precision", backend.fp32_precision))
+            backend.fp32_precision = "ieee"
+        elif hasattr(backend, "allow_tf32"):
+            saved.append((backend, "allow_tf32", backend.allow_tf32))
+            backend.allow_tf32 = False
+    try:
+        yield
+    finally:
+        for backend, attr, value in saved:
+            setattr(backend, attr, value)
+
+
 @pytest.fixture(autouse=True)
 def _fp64_identity_workspace():
     """Gates diff against float64 brute force at atol=1e-10; pin workspace."""

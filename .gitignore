@@ -10,9 +10,10 @@ dist/
 .venv/
 venv/
 
-# Editors
+# Editors and tooling state
 .vscode/
 .idea/
+.claude/
 
 # Datasets: large, downloadable, and regenerable.
 #   CIFAR-10      -> torchvision download
@@ -58,3 +59,5 @@ MEETING_DELIVERY.md
 internship-evidence-*.md
 docs/QWEN_MEETING_NOTES.md
 docs/QWEN_RESULTS.md
+docs/QWEN_ENGINE_PLAN.md
+docs/MEETING_SCRIPT.md

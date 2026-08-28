@@ -52,7 +52,7 @@ from torch import nn
 
 from jdgram.engine import registry
 from jdgram.engine.hooks import compute_gramian
-from jdgram.engine.residual import residual_gramian, residual_params
+from jdgram.engine.residual import residual_params
 from jdgram.identities.tied import tied_gramian
 
 MODES = ("independent", "duplicate", "conflicting")
@@ -81,31 +81,76 @@ class Sink:
                  error=f"{type(exc).__name__}: {msg[:300]}", **kw)
         if not oom:
             traceback.print_exc()
+        # Drop the traceback before returning. It references every frame of the
+        # failed call, and those frames hold the hook manager, its captures, and
+        # through them the whole forward graph. Keeping it alive is how one
+        # failed cell leaks gigabytes into the next cell's baseline -- which is
+        # what made the published m=4 OOM a measurement of the harness rather
+        # than of the engine.
+        exc.__traceback__ = None
         return oom
 
 
-def _scrub() -> None:
-    """Drop dead tensors and return cached blocks, so the next peak is honest."""
-    gc.collect()
+def _scrub(passes: int = 3) -> None:
+    """Drop dead tensors and return cached blocks, so the next peak is honest.
+
+    Collects more than once on purpose. The engine's live structures form
+    reference *cycles* -- a capture holds the graph, the graph's nodes hold the
+    capture back -- and a cycle is only reclaimed once nothing outside it refers
+    in. Freeing one cycle can drop the last reference into another, so a single
+    pass reliably leaves some of them standing; three converges in practice.
+    """
+    for _ in range(passes):
+        gc.collect()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
 
+#: Live bytes on entering a cell, in MiB, from the first cell that recorded one.
+#: A cell whose baseline has drifted far above this is measuring leaked tensors
+#: from an earlier cell, not the engine.
+_BASELINE: dict[str, float] = {}
+
+#: Drift above the first baseline, in MiB, that marks a cell's numbers unusable.
+#: Generous on purpose: it should catch gigabyte-scale leaks, not allocator noise.
+LEAK_TOLERANCE_MIB = 512.0
+
+
 @contextlib.contextmanager
-def cell():
+def cell(sink: "Sink | None" = None, **tag):
     """Isolate one measurement: clean before and after, and report both memory numbers.
 
     ``peak_mib`` is the high-water mark of *total* allocation, which is what
     decides whether the card OOMs. ``delta_mib`` subtracts what was already
     resident on entry -- with a 3.6 GiB model live, the total is dominated by
     weights and only the delta says what the engine actually cost.
+
+    Also guards the baseline. Every cell should start with the same bytes live
+    (the weights, and nothing else); if one starts far above that, an earlier
+    cell leaked into it and both its peak and any OOM it reports are artefacts.
+    That failure mode is not hypothetical -- it is what made a previously
+    published m=4 OOM meaningless -- so it is recorded in the row rather than
+    left for someone to notice in the logs.
     """
     _scrub()
-    state = {}
+    state: dict = {}
     base = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
-    state["base_mib"] = round(base / MIB, 1)
+    base_mib = round(base / MIB, 1)
+    state["base_mib"] = base_mib
+
+    first = _BASELINE.setdefault("mib", base_mib)
+    drift = base_mib - first
+    if drift > LEAK_TOLERANCE_MIB:
+        state["baseline_drift_mib"] = round(drift, 1)
+        state["leaked"] = True
+        print(f"  !! baseline drift {drift:,.1f} MiB above {first:,.1f} MiB "
+              f"-- this cell's memory numbers are NOT trustworthy", flush=True)
+        if sink is not None:
+            sink.row(status="LEAKED", metric="baseline_drift_mib",
+                     value=round(drift, 1), base_mib=base_mib,
+                     first_base_mib=first, **tag)
     try:
         yield state
     finally:
@@ -244,10 +289,13 @@ def gramian(model, fn, hooked, shared, tail, *, driver="loop", with_tail=True,
             workspace_dtype=None, use_leaf_edges=True):
     """Identity blocks plus the materialised tail.
 
-    Two forwards when ``with_tail``: compute_gramian owns its own graph and frees
-    it, so the residual needs a fresh one. Wasteful but honest -- and it is the
-    real price of an exact Gramian on this model, so C2 reports it both ways
-    rather than quietly charging jdgram the cheaper number.
+    ONE forward, tail included. The tail parameters are handed to
+    ``compute_gramian`` as ``residual_params=``, so their gradients come out of
+    the reverse passes it already runs. This used to take a second forward plus
+    ``m`` more backwards -- ``residual_gramian`` on a fresh graph -- to reach
+    445,248 parameters (0.059% of the model) that the first traversal already
+    walked past on its way to layer 0. Measured at m=2/T=256 that tail was 757 ms
+    of a 1,858 ms step. The block is identical either way (gate 5h pins it).
 
     ``use_leaf_edges`` is a real workaround, not a tuning knob. hooks.py's
     _reverse_loop -- its own docstring: "Legacy m reverse passes -- gate/debug
@@ -263,14 +311,13 @@ def gramian(model, fn, hooked, shared, tail, *, driver="loop", with_tail=True,
     instead, a full backward against every parameter rather than a pruned
     graph walk. Slower, but sidesteps the pruning path where the bug lives.
     """
+    fold = [p for _, p in tail] if (with_tail and tail) else None
     res = compute_gramian(model, fn, modules=hooked,
                           shared_handlers=shared or None, driver=driver,
                           workspace_dtype=workspace_dtype,
-                          use_leaf_edges=use_leaf_edges)
-    G = res.total.double()
-    if with_tail and tail:
-        G = G + residual_gramian(fn(), [p for _, p in tail])
-    return G, res
+                          use_leaf_edges=use_leaf_edges,
+                          residual_params=fold)
+    return res.total.double(), res
 
 
 def cosines(G: torch.Tensor):
@@ -291,7 +338,7 @@ def C0(a, sink):
                  residual_params=sum(p.numel() for _, p in tail), total_params=total,
                  residual_frac=round(sum(p.numel() for _, p in tail) / total, 6))
 
-        with cell() as st:
+        with cell(sink, stage="C0", cell="baseline") as st:
             idx, co = batch(2, a.T, cfg.vocab_size, "independent", a.device)
             fn = losses_of(model, idx, co)
             G, res = gramian(model, fn, hooked, shared, tail, use_leaf_edges=bool(a.use_leaf_edges))
@@ -317,7 +364,7 @@ def C0(a, sink):
 
         worst: list[tuple[float, str, str]] = []
         for tname, name in by_type.items():
-            with cell() as st:
+            with cell(sink, stage="C0", cell="baseline") as st:
                 try:
                     ps = [p for p in hooked[name].parameters(recurse=False) if p.requires_grad]
                     losses = fn()
@@ -367,7 +414,7 @@ def C1(a, sink):
         small["hidden_size"] = a.bf_hidden
     for m in a.bf_ms:
         model = None
-        with cell() as st:
+        with cell(sink, stage="C1", cell="baseline") as st:
             try:
                 model, cfg = load(a.model, a.device, small=small)
                 # The whole model in float64, not just the Gramian workspace.
@@ -488,7 +535,7 @@ def C2(a, sink):
                     sink.row(stage="C2", cell="cost", engine=key, m=m, T=a.T,
                              status="SKIPPED", note="OOMed at a smaller m")
                     continue
-                with cell() as st:
+                with cell(sink, stage="C2", cell="baseline") as st:
                     try:
                         idx, co = batch(m, a.T, cfg.vocab_size, "duplicate", a.device)
                         fn = losses_of(model, idx, co)
@@ -543,7 +590,7 @@ def C3(a, sink):
                     sink.row(stage="C3", cell="conflict", mode=mode, m=m,
                              status="SKIPPED", note="OOMed at a smaller m")
                     continue
-                with cell() as st:
+                with cell(sink, stage="C3", cell="baseline") as st:
                     try:
                         idx, co = batch(m, a.T, cfg.vocab_size, mode, a.device)
                         G, res = gramian(model, losses_of(model, idx, co),
@@ -581,7 +628,7 @@ def C4(a, sink):
             ("MGDA", MGDAWeighting), ("PCGrad", PCGradWeighting)]
     for agg, W in plan:
         model = None
-        with cell() as st:
+        with cell(sink, stage="C4", cell="baseline") as st:
             try:
                 model, cfg = load(a.model, a.device, dtype=a.dtype, grad_ckpt=bool(a.grad_ckpt))
                 hooked, shared, tail = wire(model)

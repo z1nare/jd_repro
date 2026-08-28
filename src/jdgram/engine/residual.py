@@ -21,6 +21,8 @@ paying that, so pass ``retain_graph=True`` and reuse one graph for both.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 from torch import nn
 
@@ -50,6 +52,27 @@ def residual_params(
             seen.add(id(p))
             out.append((f"{mod_name}.{p_name}" if mod_name else p_name, p))
     return out
+
+
+def flatten_residual_row(
+    grads: Sequence[torch.Tensor | None],
+    params: Sequence[torch.nn.Parameter],
+) -> torch.Tensor:
+    """One objective's tail gradients, flattened into a single float64 row.
+
+    A parameter that does not participate in this objective's graph yields
+    ``None`` from ``autograd.grad``; that is a true zero block, not an error.
+    """
+    return torch.cat([
+        (torch.zeros_like(p) if g is None else g).reshape(-1).double()
+        for g, p in zip(grads, params)
+    ])
+
+
+def gramian_from_rows(rows: Sequence[torch.Tensor]) -> torch.Tensor:
+    """``[m, m]`` float64 Gramian from per-objective flattened gradient rows."""
+    J = torch.stack(list(rows))
+    return J @ J.T
 
 
 def residual_gramian(
@@ -89,12 +112,8 @@ def residual_gramian(
             retain_graph=retain_graph or (i < m - 1),
             allow_unused=allow_unused,
         )
-        rows.append(torch.cat([
-            (torch.zeros_like(p) if g is None else g).reshape(-1).double()
-            for g, p in zip(grads, params)
-        ]))
-    J = torch.stack(rows)
-    return J @ J.T
+        rows.append(flatten_residual_row(grads, params))
+    return gramian_from_rows(rows)
 
 
 def numel(params: list[torch.nn.Parameter]) -> int:
