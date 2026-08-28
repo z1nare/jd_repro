@@ -93,48 +93,9 @@ not the split.
 
 ---
 
-## F5 · Context ceiling
-
-### 5a · The allocator was the ceiling, not the arithmetic
-
-Default allocator, same byte budget — higher m dies ~2.8 GB lower:
-
-| run | m·T | peak reached | outcome |
-|---|---:|---:|---|
-| m=2, T=896 | 1,792 | **20,660** | ok |
-| m=4, T=448 | 1,792 | 18,799 | OOM |
-| m=3, T=576 | 1,728 | 17,822 | OOM |
-
-`torch.stack` needs one contiguous `[m,T,V]` block; more objectives means more small
-allocations, so the heap fragments and the large request fails early.
-
-### 5b · `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
-
-| dtype | m | before | after | |
-|---|---:|---:|---:|---|
-| fp32 | 2 | 896 | **960** | 1,024 OOM |
-| bf16 | 2 | 1,536 | **2,048** | +33% |
-| fp32 | 3 | 256 | **512+** | 576 / 640 untested |
-
-```
-m=2 context reached
-19 Aug  fp32  ██████░░░░░░░░░░░░░░░░░░    768
-28 Aug  fp32  ███████░░░░░░░░░░░░░░░░░    960    +25%
-28 Aug  bf16  ████████████████████████  2,048    2.7x
-```
-
-### 5c · With fragmentation removed, the law *is* the ceiling
-
-| dtype | m | law predicts T_max | measured | |
-|---|---:|---:|---|---|
-| fp32 | 2 | 969 | 960 ok · 1,024 OOM | ✓ within one step |
-| bf16 | 2 | 2,082 | 2,048 ok | ✓ within one step |
-
-One environment variable, no code change.
-
 ---
 
-## F6 · Exactness
+## F5 · Exactness
 
 Synthetic Qwen, 2 layers, vocab 2,048, T=32, fp64 ground-truth model.
 
@@ -153,7 +114,7 @@ Two further checks:
 
 ---
 
-## F7 · Cost of exactness — per token × objective
+## F6 · Cost of exactness — per token × objective
 
 | | MiB | note |
 |---|---:|---|
@@ -172,7 +133,7 @@ With AdamW state (752M × 16 B = 12,032 MiB) the trainable envelope is
 
 ---
 
-## F8 · Measurement integrity
+## F7 · Measurement integrity
 
 The 19 Aug m=4 OOM was an artefact. Reproduced with the old all-engines-one-process design:
 
@@ -186,7 +147,7 @@ process. Every figure above has `LEAKED = 0`.
 
 ---
 
-## F9 · Competitive position
+## F8 · Competitive position
 
 | axis | standing | evidence |
 |---|---|---|
