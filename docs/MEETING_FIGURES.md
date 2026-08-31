@@ -32,6 +32,7 @@ autogram  ███████████████████████�
 |---|---:|---:|---|
 | jdgram step | 1,857.9 ms | **1,068.8 ms** | **−42.5%** |
 | residual tail | 757.4 ms | **≈0** | eliminated |
+| jdgram peak delta | 7,598.4 MiB | 7,498.8 MiB | −1.3% |
 | vs autogram, time | +18.1% slower | **−33.1% faster** | sign flip |
 | vs autogram, memory | −24.5% | **−26.1%** | |
 | gates | 71 | **78** | +7 |
@@ -42,6 +43,10 @@ autogram  ███████████████████████�
 |---|---:|---:|---:|
 | autogram step | 1,572.6 ms | 1,596.8 ms | +1.5% |
 | autogram delta | 10,068.7 MiB | 10,148.1 MiB | +0.8% |
+
+> The −1.3% memory row is honest and worth keeping: **uncheckpointed peak is set by the
+> retained forward graph, not by captures**, so a capture fix cannot show there. It pays off
+> where captures dominate — checkpointed, higher m — which is F3.
 
 ---
 
@@ -57,7 +62,7 @@ autogram  ███████████████████████�
 | 7 | not attempted | **20,648.2** † | 7,061.2 |
 
 † with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. The default allocator OOMs at
-18,816 — fragmentation, not capacity.
+18,816 — fragmentation, not capacity. See F5.
 
 ```
 peak MiB, 22,190 cap                 19 Aug          28 Aug
@@ -80,6 +85,8 @@ fp32   delta ≈ 9.93 · (m·T) + 74   MiB          base 2,870.2
 bf16   delta ≈ 4.96 · (m·T) + 77   MiB          base 1,459.1
 ```
 
+Validation across **both axes**, both dtypes:
+
 | dtype | m | T | m·T | measured | predicted | err |
 |---|---:|---:|---:|---:|---:|---:|
 | fp32 | 2 | 256 | 512 | 5,157.4 | 5,158 | 0.0% |
@@ -88,13 +95,23 @@ bf16   delta ≈ 4.96 · (m·T) + 77   MiB          base 1,459.1
 | fp32 | 5 | 256 | 1,280 | 12,821.3 | 12,784 | 0.3% |
 | **fp32** | **6** | **256** | **1,536** | **15,341.5** | 15,326 | 0.1% |
 | **fp32** | **2** | **768** | **1,536** | **15,307.9** | 15,326 | 0.1% |
-| fp32 | 2 | 896 | 1,792 | 17,790.1 | 17,868 | 0.4% |
+| **fp32** | **7** | **256** | **1,792** | **17,761.8** | 17,868 | 0.6% |
+| **fp32** | **2** | **896** | **1,792** | **17,790.1** | 17,868 | 0.4% |
 | bf16 | 2 | 1024 | 2,048 | 10,226.6 | 10,236 | 0.1% |
 | bf16 | 2 | 1536 | 3,072 | 15,301.3 | 15,314 | 0.1% |
+| bf16 | 2 | 2048 | 4,096 | fits — peak 21.9 GB | 20,393 | — |
 
-**Rows 5 and 6:** same `m·T`, opposite splits — 6 objectives × 256 tokens versus
-2 × 768. **15,341.5 against 15,307.9: 33 MiB apart.** Memory depends on the product,
-not the split.
+**⭐⭐ Two independent confirmations that only the product matters** — same `m·T`,
+opposite splits:
+
+| m·T | tall split | wide split | apart |
+|---:|---|---|---:|
+| 1,536 | m=6 × T=256 → 15,341.5 | m=2 × T=768 → 15,307.9 | **33.6 MiB (0.22%)** |
+| 1,792 | m=7 × T=256 → 17,761.8 | m=2 × T=896 → 17,790.1 | **28.3 MiB (0.16%)** |
+
+Seven objectives at 256 tokens costs the same as two objectives at 896 tokens, to within
+0.16%. **Memory does not care how you split the budget — only the total token-objective
+count.**
 
 **bf16 slope 4.956 = 9.93 / 2.00** — the law is dtype-scaled exactly.
 
@@ -110,6 +127,7 @@ Default allocator, same byte budget — higher m dies ~2.8 GB lower:
 |---|---:|---:|---|
 | m=2, T=896 | 1,792 | **20,660** | ok |
 | m=4, T=448 | 1,792 | 18,799 | OOM |
+| m=7, T=256 | 1,792 | 18,816 | OOM |
 | m=3, T=576 | 1,728 | 17,822 | OOM |
 
 `torch.stack` needs one contiguous `[m,T,V]` block; more objectives means more small
@@ -137,7 +155,8 @@ m=2 context reached
 | fp32 | 2 | 969 | 960 ok · 1,024 OOM | ✓ within one step |
 | bf16 | 2 | 2,082 | 2,048 ok | ✓ within one step |
 
-One environment variable, no code change.
+One environment variable, no code change. After it, `9.93·(m·T)` is the complete capacity
+model — there is no unexplained overhead left.
 
 ---
 
@@ -158,8 +177,8 @@ Synthetic Qwen, 2 layers, vocab 2,048, T=32, fp64 ground-truth model.
 | mean, fp64 workspace only | 3.26×10⁻¹² | **3.04×10⁻¹²** |
 
 The all-checks mean is dominated by the ten fp32-workspace per-module blocks
-(mean 2.45×10⁻⁸), so it measures **workspace precision**, not the method. The
-method's own floor is the fp64 row at ~3×10⁻¹². **Neither moved.**
+(mean 2.45×10⁻⁸), so it measures **workspace precision**, not the method. The method's own
+floor is the fp64 row at ~3×10⁻¹². **Neither moved.**
 
 Two further checks:
 - **`G` bit-identical across the capture fix** — `max|ΔG| = 0.000e+00`, m = 1…6
@@ -221,7 +240,8 @@ process. Every figure above has `LEAKED = 0`.
 
 ## Not yet measured
 
-- end-to-end training multiplier vs plain SGD (the C4 run diverged at `--lr 0.01`; needs
-  a re-run at `1e-5`, one aggregator per process)
-- m=8 — the law puts it at ~23,240 MiB against a 22,190 cap, so it should *not* fit
+- end-to-end training multiplier vs plain SGD — the C4 run diverged at `--lr 0.01`
+  (control returned NaN); needs a re-run at `1e-5`, one aggregator per process
+- **m=8** — the law puts it at ~23,240 MiB against a 22,190 cap, so it should *not* fit
 - m=3 ceiling between T=512 and T=646; m=4 ceiling above T=256
+- real (non-synthetic) objectives — every conflict number so far is a constructed control
